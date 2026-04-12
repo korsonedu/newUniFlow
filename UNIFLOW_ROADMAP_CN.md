@@ -26,9 +26,11 @@
   - 工作栏参数模型收敛：`ToolParameterModel(color/width/opacity/smoothing/snap)` 已接入画布
   - 原生迁移 Phase-1：Rust `native_core`（时间轴引擎）+ Tauri 时间轴命令桥 + 前端 `NativeTimelineAdapter`（自动降级到 TS 引擎）
   - 发布顺序门禁：新增 `scripts/release-lane.mjs`，支持 `require/mark/status/reset`，执行顺序强制为 `macOS -> iPadOS -> Windows`
+  - 仓库基线提交：`763642d`（本地主分支 `main`，工作区已清洁）
 - 进行中：
   - 代码层统一错误返回（`Result<T,E>`）与错误码收敛
   - 平台能力进一步抽象（file/dialog/audio/export）
+  - GitHub 远端推送阻塞：已配置 `origin=git@github.com:korsonedu/newUniFlow.git`，待机器完成 GitHub 认证后执行 `git push -u origin main`
 
 ---
 

@@ -1,0 +1,53 @@
+{
+  "name": "uniflow",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:web": "vite",
+    "desktop:prepare": "node ./scripts/ensure-tauri-icons.mjs",
+    "dev:desktop": "npm run desktop:prepare && tauri dev",
+    "dev:macos:debug": "node ./scripts/dev-macos-debug.mjs",
+    "build": "npm run typecheck && vite build",
+    "build:web": "npm run build",
+    "build:desktop": "npm run desktop:prepare && tauri build",
+    "build:desktop:mac": "npm run desktop:prepare && tauri build --bundles app,dmg",
+    "build:desktop:win": "npm run desktop:prepare && tauri build --bundles msi,nsis",
+    "mobile:sync": "npm run build && cap sync",
+    "mobile:ipad": "npm run mobile:sync && cap open ios",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test:timeline": "node ./scripts/timeline-regression.mjs",
+    "doctor:platform": "node ./scripts/platform-doctor.mjs all",
+    "doctor:macos": "node ./scripts/platform-doctor.mjs macos",
+    "doctor:ipados": "node ./scripts/platform-doctor.mjs ipados",
+    "doctor:windows": "node ./scripts/platform-doctor.mjs windows",
+    "rollout:status": "node ./scripts/release-lane.mjs status",
+    "rollout:reset": "node ./scripts/release-lane.mjs reset",
+    "verify:macos": "node ./scripts/release-lane.mjs require macos && npm run doctor:macos && npm run typecheck && npm run test:timeline && npm run build:desktop:mac && node ./scripts/release-lane.mjs mark macos",
+    "verify:ipados": "node ./scripts/release-lane.mjs require ipados && npm run doctor:ipados && npm run typecheck && npm run test:timeline && npm run mobile:sync && node ./scripts/release-lane.mjs mark ipados",
+    "verify:windows": "node ./scripts/release-lane.mjs require windows && npm run doctor:windows && npm run typecheck && npm run test:timeline && npm run build:desktop:win && node ./scripts/release-lane.mjs mark windows"
+  },
+  "dependencies": {
+    "@capacitor/core": "^6.1.2",
+    "@tauri-apps/api": "^2.0.0",
+    "jszip": "^3.10.1",
+    "pdfjs-dist": "^5.6.205",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-icons": "^5.6.0",
+    "zustand": "^5.0.8"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.1.2",
+    "@capacitor/ios": "^6.1.2",
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.7",
+    "vite-plugin-pwa": "^0.20.5"
+  }
+}

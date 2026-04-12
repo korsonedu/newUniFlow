@@ -1,0 +1,16 @@
+node_modules/
+dist/
+release/
+.DS_Store
+*.log
+
+# Capacitor / Xcode
+ios/App/App/public/
+ios/App/App/capacitor.config.json
+ios/App/App/Pods/
+ios/App/App/Podfile.lock
+ios/App/App/App.xcworkspace/
+
+# Rust/Tauri build outputs
+src-tauri/target/
+.tmp/

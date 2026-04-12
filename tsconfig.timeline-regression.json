@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "./.tmp/timeline-regression",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": [
+    "src/application/timeline/regressionSuite.ts",
+    "src/application/timeline/regressionSuite.cli.ts",
+    "src/store/useWhiteboardStore.ts",
+    "src/application/timeline/transactions.ts",
+    "src/engine/timelineEngine.ts",
+    "src/domain/**/*.ts",
+    "src/store/snapshot.ts",
+    "src/utils/id.ts"
+  ]
+}

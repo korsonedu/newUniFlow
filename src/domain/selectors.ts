@@ -21,7 +21,18 @@ const getSortedObjects = (page: PageState): WhiteboardObject[] => {
     return cached;
   }
 
-  const sorted = Object.values(page.objects).sort((a, b) => a.createdAt - b.createdAt);
+  const resolveZIndex = (object: WhiteboardObject): number => {
+    const raw = object.style?.zIndex;
+    return typeof raw === 'number' && Number.isFinite(raw) ? raw : 0;
+  };
+
+  const sorted = Object.values(page.objects).sort((a, b) => {
+    const z = resolveZIndex(a) - resolveZIndex(b);
+    if (z !== 0) {
+      return z;
+    }
+    return a.createdAt - b.createdAt;
+  });
   sortedObjectCache.set(page, sorted);
   return sorted;
 };
@@ -71,6 +82,47 @@ export const getStrokePointsAtTime = (stroke: Stroke, time: number): Point[] => 
     return stroke.points;
   }
 
+  const resolveVisibleCount = (): number => {
+    let lo = 0;
+    let hi = pointTimes.length - 1;
+    let lastVisible = -1;
+
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const pointTime = normalizeTimelineTime(pointTimes[mid]);
+      if (pointTime <= t) {
+        lastVisible = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+
+    return lastVisible + 1;
+  };
+
+  const visibleCount = resolveVisibleCount();
+  if (visibleCount <= 0) {
+    return [];
+  }
+
+  return stroke.points.slice(0, visibleCount);
+};
+
+export const getStrokePointPressuresAtTime = (
+  stroke: Stroke,
+  time: number,
+): number[] | undefined => {
+  const pointTimes = stroke.pointTimes;
+  const pointPressures = stroke.pointPressures;
+  if (!pointPressures || !pointTimes) {
+    return undefined;
+  }
+  if (pointPressures.length !== stroke.points.length || pointTimes.length !== stroke.points.length) {
+    return undefined;
+  }
+
+  const t = normalizeTimelineTime(time);
   let lo = 0;
   let hi = pointTimes.length - 1;
   let lastVisible = -1;
@@ -87,12 +139,11 @@ export const getStrokePointsAtTime = (stroke: Stroke, time: number): Point[] => 
   }
 
   const visibleCount = lastVisible + 1;
-
   if (visibleCount <= 0) {
     return [];
   }
 
-  return stroke.points.slice(0, visibleCount);
+  return pointPressures.slice(0, visibleCount);
 };
 
 export const findNearestPoint = (target: Point, points: Point[]): Point | undefined => {

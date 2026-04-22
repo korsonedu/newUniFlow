@@ -3,6 +3,13 @@ import {
   ProjectAssetType,
   ProjectPage,
 } from '../domain/types';
+import {
+  createCanvasElement,
+  createImageElement,
+  createObjectUrl,
+  revokeObjectUrl,
+} from '../infrastructure/platform/domFactory';
+import { getDevicePixelRatio } from '../infrastructure/platform/windowSession';
 import { saveAssetBlob, StoredAssetRef } from './assetStore';
 import { generateId } from './id';
 
@@ -110,7 +117,10 @@ const createPlaceholderSlideBlob = async (
 ): Promise<Blob> => {
   const w = clampDimension(width, 1366);
   const h = clampDimension(height, 768);
-  const canvas = document.createElement('canvas');
+  const canvas = createCanvasElement();
+  if (!canvas) {
+    return new Blob([], { type: 'image/png' });
+  }
   canvas.width = w;
   canvas.height = h;
   const ctx = canvas.getContext('2d');
@@ -193,10 +203,20 @@ const buildPageDraft = async (options: {
 };
 
 const readImageDimension = async (file: File): Promise<{ width: number; height: number }> => {
-  const url = URL.createObjectURL(file);
+  const url = createObjectUrl(file);
+  if (!url) {
+    return {
+      width: 1366,
+      height: 768,
+    };
+  }
   try {
     const image = await new Promise<HTMLImageElement>((resolve, reject) => {
-      const img = new Image();
+      const img = createImageElement();
+      if (!img) {
+        reject(new Error('Image element unavailable'));
+        return;
+      }
       img.onload = () => resolve(img);
       img.onerror = () => reject(new Error('Image decode failed'));
       img.src = url;
@@ -206,7 +226,7 @@ const readImageDimension = async (file: File): Promise<{ width: number; height: 
       height: clampDimension(image.naturalHeight, 768),
     };
   } finally {
-    URL.revokeObjectURL(url);
+    revokeObjectUrl(url);
   }
 };
 
@@ -233,11 +253,15 @@ const importPdfFromBlob = async (
     const height = clampDimension(viewport.height, 768);
     const oversampleScale = Math.max(
       2,
-      Math.min(4, Math.round((typeof window !== 'undefined' ? window.devicePixelRatio : 2) * 2) / 2),
+      Math.min(4, Math.round(getDevicePixelRatio(2) * 2) / 2),
     );
     const renderWidth = Math.max(width, Math.round(width * oversampleScale));
     const renderHeight = Math.max(height, Math.round(height * oversampleScale));
-    const canvas = document.createElement('canvas');
+    const canvas = createCanvasElement();
+    if (!canvas) {
+      warnings.push(`PDF page ${pageIndex + 1} render canvas unavailable.`);
+      continue;
+    }
     canvas.width = renderWidth;
     canvas.height = renderHeight;
     const context = canvas.getContext('2d', { alpha: false });

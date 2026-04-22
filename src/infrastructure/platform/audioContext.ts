@@ -55,8 +55,12 @@ export const createStreamAnalyser = (
   try {
     const source = context.createMediaStreamSource(stream);
     const analyser = context.createAnalyser();
+    const sink = context.createGain();
     analyser.fftSize = fftSize;
+    sink.gain.value = 0;
     source.connect(analyser);
+    analyser.connect(sink);
+    sink.connect(context.destination);
     void context.resume();
 
     return {
@@ -70,6 +74,11 @@ export const createStreamAnalyser = (
         }
         try {
           analyser.disconnect();
+        } catch {
+          // ignore disconnect races
+        }
+        try {
+          sink.disconnect();
         } catch {
           // ignore disconnect races
         }

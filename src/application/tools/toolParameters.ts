@@ -6,7 +6,6 @@ export type ToolParameterModel = {
   highlighterWidth: number;
   highlighterOpacity: number;
   eraserRadius: number;
-  smoothing: number;
   snap: boolean;
 };
 
@@ -18,7 +17,6 @@ export const DEFAULT_TOOL_PARAMETERS: ToolParameterModel = {
   highlighterWidth: 12,
   highlighterOpacity: 0.34,
   eraserRadius: 14,
-  smoothing: 0.6,
   snap: true,
 };
 
@@ -50,7 +48,6 @@ export const normalizeToolParameters = (params: Partial<ToolParameterModel>): To
     highlighterWidth: clamp(Number(next.highlighterWidth) || DEFAULT_TOOL_PARAMETERS.highlighterWidth, 4, 48),
     highlighterOpacity: clamp(Number(next.highlighterOpacity) || DEFAULT_TOOL_PARAMETERS.highlighterOpacity, 0.05, 1),
     eraserRadius: clamp(Number(next.eraserRadius) || DEFAULT_TOOL_PARAMETERS.eraserRadius, 4, 40),
-    smoothing: clamp(Number(next.smoothing) || DEFAULT_TOOL_PARAMETERS.smoothing, 0, 1),
     snap: Boolean(next.snap),
   };
 };

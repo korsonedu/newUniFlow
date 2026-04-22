@@ -19,6 +19,7 @@ import {
 } from '../domain/types';
 import {
   executeTimelineCommand,
+  executeTimelineCommandAsync,
   TimelineCommand,
   TimelineTransaction,
 } from '../application/timeline/transactions';
@@ -44,10 +45,13 @@ import {
   snapshotToJson,
 } from './snapshot';
 import {
-  createMockWaveform,
   deleteRangeFromAudioSegments,
   deriveTimelineSegments,
 } from '../domain/timelineSegments';
+import {
+  hasNativeTimelineRuntime,
+  nativeTimelineAdapter,
+} from '../infrastructure/platform/nativeTimeline';
 
 const INITIAL_STATE = createInitialProjectState(DEFAULT_PROJECT_ID, DEFAULT_PAGE_ID);
 const INITIAL_PROJECT: ProjectMeta = {
@@ -153,6 +157,7 @@ export type WhiteboardStore = {
   deleteFuture: (time: number) => void;
   splitAt: (time: number) => void;
   seek: (time: number) => void;
+  setRuntimeCurrentTime: (time: number) => void;
   rebuild: () => void;
   undo: () => void;
   redo: () => void;
@@ -232,16 +237,16 @@ const clampCurrentTime = (time: number, events: TimelineEvent[], audioSegments: 
 const buildProjectMeta = (previous: ProjectMeta, state: ProjectState): ProjectMeta => {
   const existing = [...previous.pages].sort((a, b) => a.order - b.order);
   const existingById = new Map(existing.map((page) => [page.id, page]));
-  const statePageIds = Object.keys(state.pages);
-
   const orderIds: string[] = [];
   for (const page of existing) {
     orderIds.push(page.id);
   }
-  for (const pageId of statePageIds) {
-    if (!existingById.has(pageId)) {
-      orderIds.push(pageId);
-    }
+
+  // Keep project page metadata as the primary source of truth so deleted pages
+  // are not re-hydrated from historical replay state. We only append the
+  // currently active page when replay reaches a page that metadata does not yet know about.
+  if (state.currentPageId && !existingById.has(state.currentPageId)) {
+    orderIds.push(state.currentPageId);
   }
 
   const pages = orderIds.map((id, index) => {
@@ -310,6 +315,65 @@ const applyTimeline = (
     audioSegments,
     currentTime: safeTime,
     state,
+  };
+};
+
+const applyTimelineAsync = async (
+  events: TimelineEvent[],
+  time: number,
+  project: ProjectMeta,
+  audioSegments: AudioSegment[],
+): Promise<Pick<
+  InternalStore,
+  'project' | 'events' | 'timelineSegments' | 'audioSegments' | 'currentTime' | 'state'
+>> => {
+  const sorted = sortEvents(events);
+  const maxPlayableTime = Math.max(
+    await nativeTimelineAdapter.getTimelineMaxTime(sorted),
+    getAudioMaxTime(audioSegments),
+  );
+  const safeTime = Math.min(normalizeTimelineTime(time), maxPlayableTime);
+  const state = await nativeTimelineAdapter.getStateAtTime(INITIAL_STATE, sorted, safeTime);
+  const timelineSegments = deriveTimelineSegments(
+    project.id,
+    state.currentPageId,
+    sorted,
+    maxPlayableTime,
+  );
+  const nextProject = buildProjectMeta(project, state);
+
+  return {
+    project: nextProject,
+    events: sorted,
+    timelineSegments,
+    audioSegments,
+    currentTime: safeTime,
+    state,
+  };
+};
+
+const applyHistorySnapshotAsync = async (
+  store: InternalStore,
+  snapshot: TimelineSnapshot,
+  history: History,
+): Promise<Partial<InternalStore>> => {
+  const timeline = await applyTimelineAsync(
+    snapshot.events,
+    store.currentTime,
+    store.project,
+    snapshot.audioSegments,
+  );
+
+  return {
+    ...timeline,
+    selectedEventId: ensureSelectedEventId(store.selectedEventId, timeline.events),
+    selectedSegmentId: ensureSelectedSegmentId(
+      store.selectedSegmentId,
+      timeline.timelineSegments,
+    ),
+    recordingStatus: store.recordingStatus,
+    lastTransaction: snapshot.transaction,
+    history,
   };
 };
 
@@ -392,6 +456,181 @@ const applyTimelineCommandWithTransaction = (
   };
 };
 
+const applyTimelineCommandWithTransactionAsync = async (
+  store: InternalStore,
+  command: TimelineCommand,
+  transaction: TimelineTransaction,
+  options?: {
+    historyMode?: 'always' | 'auto' | 'never';
+    setLastTransaction?: boolean;
+  },
+): Promise<Partial<InternalStore> | null> => {
+  const result = await executeTimelineCommandAsync(
+    {
+      currentTime: store.currentTime,
+      currentPageId: store.state.currentPageId,
+      events: store.events,
+      audioSegments: store.audioSegments,
+      timelineSegments: store.timelineSegments,
+      createEvent: (event) => store.createTimelineEvent(event),
+    },
+    command,
+  );
+
+  if (!result.applied) {
+    return null;
+  }
+
+  const timeline = await applyTimelineAsync(
+    result.events,
+    result.currentTime,
+    store.project,
+    result.audioSegments,
+  );
+  const historyMode = options?.historyMode ?? 'always';
+  const shouldPushHistory = historyMode === 'always'
+    ? true
+    : historyMode === 'auto'
+      ? store.recordingStatus === 'idle'
+      : false;
+  const shouldSetLastTransaction = options?.setLastTransaction ?? true;
+  return {
+    ...timeline,
+    selectedEventId: ensureSelectedEventId(store.selectedEventId, timeline.events),
+    selectedSegmentId: ensureSelectedSegmentId(
+      store.selectedSegmentId,
+      timeline.timelineSegments,
+    ),
+    recordingStatus: store.recordingStatus,
+    splitResult: undefined,
+    lastTransaction: shouldSetLastTransaction ? transaction : store.lastTransaction,
+    history: shouldPushHistory
+      ? withHistoryPush(store.history, store.events, store.audioSegments, transaction)
+      : store.history,
+  };
+};
+
+let nativeMutationQueue: Promise<void> = Promise.resolve();
+let nativeSeekToken = 0;
+let nativeSplitToken = 0;
+
+const enqueueNativeMutation = (task: () => Promise<void>): void => {
+  nativeMutationQueue = nativeMutationQueue
+    .then(task)
+    .catch((error) => {
+      if (typeof console !== 'undefined' && typeof console.error === 'function') {
+        console.error('[UniFlow] Native timeline mutation failed, state kept unchanged.', error);
+      }
+    });
+};
+
+const createPageSetEvent = (
+  currentPageId: string,
+  currentTime: number,
+  targetPageId: string,
+): TimelineEvent => ({
+  id: generateId('evt'),
+  projectId: DEFAULT_PROJECT_ID,
+  pageId: currentPageId,
+  actorId: 'local-actor',
+  time: normalizeTimelineTime(currentTime),
+  type: TimelineEventType.PAGE_SET,
+  targetId: targetPageId,
+  payload: { pageId: targetPageId },
+});
+
+const buildProjectWithPages = (
+  store: InternalStore,
+  pages: ProjectPage[],
+  touchUpdatedAt: boolean,
+): ProjectMeta => ({
+  ...store.project,
+  pages,
+  updatedAt: touchUpdatedAt
+    ? new Date().toISOString()
+    : store.project.updatedAt,
+});
+
+const resolveSplitTarget = (
+  timelineSegments: TimelineSegment[],
+  splitTime: number,
+  selectedSegmentId?: string,
+): TimelineSegment | undefined => {
+  const selectedSegment = selectedSegmentId
+    ? timelineSegments.find((segment) => segment.id === selectedSegmentId)
+    : undefined;
+  const selectedContainsTime = selectedSegment
+    ? splitTime > selectedSegment.startTime && splitTime < selectedSegment.endTime
+    : false;
+  if (selectedContainsTime) {
+    return selectedSegment;
+  }
+  return timelineSegments.find(
+    (segment) => splitTime > segment.startTime && splitTime < segment.endTime,
+  );
+};
+
+const applyProjectPagesTimeline = (
+  store: InternalStore,
+  nextPages: ProjectPage[],
+  options?: {
+    switchToPageId?: string;
+    touchUpdatedAt?: boolean;
+  },
+): Partial<InternalStore> => {
+  const switchToPageId = options?.switchToPageId;
+  const shouldSwitch = !!switchToPageId && switchToPageId !== store.state.currentPageId;
+  const nextEvents = shouldSwitch
+    ? insertEvent(store.events, createPageSetEvent(
+      store.state.currentPageId,
+      store.currentTime,
+      switchToPageId,
+    ))
+    : store.events;
+
+  const timeline = applyTimeline(
+    nextEvents,
+    store.currentTime,
+    buildProjectWithPages(store, nextPages, options?.touchUpdatedAt !== false),
+    store.audioSegments,
+  );
+
+  return {
+    ...timeline,
+    recordingStatus: store.recordingStatus,
+  };
+};
+
+const applyProjectPagesTimelineAsync = async (
+  store: InternalStore,
+  nextPages: ProjectPage[],
+  options?: {
+    switchToPageId?: string;
+    touchUpdatedAt?: boolean;
+  },
+): Promise<Partial<InternalStore>> => {
+  const switchToPageId = options?.switchToPageId;
+  const shouldSwitch = !!switchToPageId && switchToPageId !== store.state.currentPageId;
+  const nextEvents = shouldSwitch
+    ? await nativeTimelineAdapter.insertEvent(
+      store.events,
+      createPageSetEvent(store.state.currentPageId, store.currentTime, switchToPageId),
+    )
+    : store.events;
+
+  const timeline = await applyTimelineAsync(
+    nextEvents,
+    store.currentTime,
+    buildProjectWithPages(store, nextPages, options?.touchUpdatedAt !== false),
+    store.audioSegments,
+  );
+
+  return {
+    ...timeline,
+    recordingStatus: store.recordingStatus,
+  };
+};
+
 const hydrated = loadSnapshotFromStorage();
 const hydratedEvents = hydrated?.events ?? [];
 const hydratedAudio = hydrated?.audioSegments ?? [];
@@ -429,6 +668,27 @@ export const useWhiteboardStore = create<InternalStore>((set, get) => ({
   },
 
   dispatchEvent: (event) => {
+    if (hasNativeTimelineRuntime()) {
+      enqueueNativeMutation(async () => {
+        const store = get();
+        const tx = createTransaction('insert_event', {
+          eventId: event.id,
+          eventType: event.type,
+          time: normalizeTimelineTime(event.time),
+        });
+        const next = await applyTimelineCommandWithTransactionAsync(store, {
+          kind: 'insert_event',
+          event,
+        }, tx, {
+          historyMode: 'auto',
+          setLastTransaction: false,
+        });
+        if (next) {
+          set(next as Partial<InternalStore>);
+        }
+      });
+      return;
+    }
     set((store) => {
       const tx = createTransaction('insert_event', {
         eventId: event.id,
@@ -459,6 +719,28 @@ export const useWhiteboardStore = create<InternalStore>((set, get) => ({
   },
 
   deleteEvent: (eventId) => {
+    if (hasNativeTimelineRuntime()) {
+      enqueueNativeMutation(async () => {
+        const store = get();
+        const tx = createTransaction('delete_event', { eventId });
+        const next = await applyTimelineCommandWithTransactionAsync(store, {
+          kind: 'delete_event',
+          eventId,
+        }, tx);
+        if (!next) {
+          return;
+        }
+        const nextEvents = next.events ?? store.events;
+        set({
+          ...next,
+          selectedEventId: ensureSelectedEventId(
+            store.selectedEventId === eventId ? undefined : store.selectedEventId,
+            nextEvents,
+          ),
+        } as Partial<InternalStore>);
+      });
+      return;
+    }
     set((store) => {
       const tx = createTransaction('delete_event', { eventId });
       const next = applyTimelineCommandWithTransaction(store, {
@@ -481,6 +763,25 @@ export const useWhiteboardStore = create<InternalStore>((set, get) => ({
   },
 
   deleteRange: (start, end) => {
+    if (hasNativeTimelineRuntime()) {
+      enqueueNativeMutation(async () => {
+        const range = normalizeTimelineRange(start, end);
+        const store = get();
+        const tx = createTransaction('delete_range', {
+          start: range.start,
+          end: range.end,
+        });
+        const next = await applyTimelineCommandWithTransactionAsync(store, {
+          kind: 'delete_range',
+          start: range.start,
+          end: range.end,
+        }, tx);
+        if (next) {
+          set(next as Partial<InternalStore>);
+        }
+      });
+      return;
+    }
     set((store) => {
       const range = normalizeTimelineRange(start, end);
       const tx = createTransaction('delete_range', {
@@ -496,6 +797,26 @@ export const useWhiteboardStore = create<InternalStore>((set, get) => ({
   },
 
   rippleDeleteRange: (start, end) => {
+    if (hasNativeTimelineRuntime()) {
+      enqueueNativeMutation(async () => {
+        const range = normalizeTimelineRange(start, end);
+        const store = get();
+        const tx = createTransaction('ripple_delete_range', {
+          start: range.start,
+          end: range.end,
+          duration: getTimelineDuration(range.start, range.end),
+        });
+        const next = await applyTimelineCommandWithTransactionAsync(store, {
+          kind: 'ripple_delete_range',
+          start: range.start,
+          end: range.end,
+        }, tx);
+        if (next) {
+          set(next as Partial<InternalStore>);
+        }
+      });
+      return;
+    }
     set((store) => {
       const range = normalizeTimelineRange(start, end);
       const tx = createTransaction('ripple_delete_range', {
@@ -512,6 +833,21 @@ export const useWhiteboardStore = create<InternalStore>((set, get) => ({
   },
 
   deleteFuture: (time) => {
+    if (hasNativeTimelineRuntime()) {
+      enqueueNativeMutation(async () => {
+        const at = normalizeTimelineTime(time);
+        const store = get();
+        const tx = createTransaction('delete_future', { time: at });
+        const next = await applyTimelineCommandWithTransactionAsync(store, {
+          kind: 'delete_future',
+          time: at,
+        }, tx);
+        if (next) {
+          set(next as Partial<InternalStore>);
+        }
+      });
+      return;
+    }
     set((store) => {
       const at = normalizeTimelineTime(time);
       const tx = createTransaction('delete_future', { time: at });
@@ -523,12 +859,56 @@ export const useWhiteboardStore = create<InternalStore>((set, get) => ({
   },
 
   splitAt: (time) => {
+    if (hasNativeTimelineRuntime()) {
+      const store = get();
+      const splitTime = normalizeTimelineTime(time);
+      const token = nativeSplitToken + 1;
+      nativeSplitToken = token;
+      void nativeTimelineAdapter.splitTimeline(store.events, splitTime)
+        .then((splitResult) => {
+          if (token !== nativeSplitToken) {
+            return;
+          }
+          set({ splitResult });
+        })
+        .catch((error) => {
+          if (typeof console !== 'undefined' && typeof console.error === 'function') {
+            console.error('[UniFlow] Native timeline split preview failed, state kept unchanged.', error);
+          }
+        });
+      return;
+    }
     set((store) => ({
       splitResult: splitTimeline(store.events, time),
     }));
   },
 
   seek: (time) => {
+    if (hasNativeTimelineRuntime()) {
+      const store = get();
+      const safeTime = clampCurrentTime(time, store.events, store.audioSegments);
+      const token = nativeSeekToken + 1;
+      nativeSeekToken = token;
+      set({
+        currentTime: safeTime,
+      });
+      void nativeTimelineAdapter.getStateAtTime(INITIAL_STATE, store.events, safeTime)
+        .then((state) => {
+          if (token !== nativeSeekToken) {
+            return;
+          }
+          set({
+            currentTime: safeTime,
+            state,
+          });
+        })
+        .catch((error) => {
+          if (typeof console !== 'undefined' && typeof console.error === 'function') {
+            console.error('[UniFlow] Native timeline seek failed, state kept unchanged.', error);
+          }
+        });
+      return;
+    }
     set((store) => {
       const t = normalizeTimelineTime(time);
       return {
@@ -538,7 +918,34 @@ export const useWhiteboardStore = create<InternalStore>((set, get) => ({
     });
   },
 
+  setRuntimeCurrentTime: (time) => {
+    set({
+      currentTime: normalizeTimelineTime(time),
+    });
+  },
+
   rebuild: () => {
+    if (hasNativeTimelineRuntime()) {
+      enqueueNativeMutation(async () => {
+        const store = get();
+        const timeline = await applyTimelineAsync(
+          store.events,
+          store.currentTime,
+          store.project,
+          store.audioSegments,
+        );
+        set({
+          ...timeline,
+          selectedEventId: ensureSelectedEventId(store.selectedEventId, timeline.events),
+          selectedSegmentId: ensureSelectedSegmentId(
+            store.selectedSegmentId,
+            timeline.timelineSegments,
+          ),
+          recordingStatus: store.recordingStatus,
+        } as Partial<InternalStore>);
+      });
+      return;
+    }
     set((store) => {
       const timeline = applyTimeline(store.events, store.currentTime, store.project, store.audioSegments);
       return {
@@ -554,6 +961,31 @@ export const useWhiteboardStore = create<InternalStore>((set, get) => ({
   },
 
   undo: () => {
+    if (hasNativeTimelineRuntime()) {
+      enqueueNativeMutation(async () => {
+        const store = get();
+        if (store.history.past.length === 0) {
+          return;
+        }
+
+        const previous = store.history.past[store.history.past.length - 1];
+        const nextPast = store.history.past.slice(0, -1);
+        const nextFuture = [
+          ...store.history.future,
+          {
+            events: store.events,
+            audioSegments: store.audioSegments,
+            transaction: store.lastTransaction,
+          },
+        ];
+        const next = await applyHistorySnapshotAsync(store, previous, {
+          past: nextPast,
+          future: nextFuture,
+        });
+        set(next as Partial<InternalStore>);
+      });
+      return;
+    }
     set((store) => {
       if (store.history.past.length === 0) {
         return {};
@@ -594,6 +1026,31 @@ export const useWhiteboardStore = create<InternalStore>((set, get) => ({
   },
 
   redo: () => {
+    if (hasNativeTimelineRuntime()) {
+      enqueueNativeMutation(async () => {
+        const store = get();
+        if (store.history.future.length === 0) {
+          return;
+        }
+
+        const nextSnapshot = store.history.future[store.history.future.length - 1];
+        const nextFuture = store.history.future.slice(0, -1);
+        const nextPast = [
+          ...store.history.past,
+          {
+            events: store.events,
+            audioSegments: store.audioSegments,
+            transaction: store.lastTransaction,
+          },
+        ];
+        const next = await applyHistorySnapshotAsync(store, nextSnapshot, {
+          past: nextPast,
+          future: nextFuture,
+        });
+        set(next as Partial<InternalStore>);
+      });
+      return;
+    }
     set((store) => {
       if (store.history.future.length === 0) {
         return {};
@@ -634,6 +1091,25 @@ export const useWhiteboardStore = create<InternalStore>((set, get) => ({
   },
 
   moveEventTime: (eventId, newTime) => {
+    if (hasNativeTimelineRuntime()) {
+      enqueueNativeMutation(async () => {
+        const normalizedTime = normalizeTimelineTime(newTime);
+        const store = get();
+        const tx = createTransaction('move_event_time', {
+          eventId,
+          newTime: normalizedTime,
+        });
+        const next = await applyTimelineCommandWithTransactionAsync(store, {
+          kind: 'move_event_time',
+          eventId,
+          newTime: normalizedTime,
+        }, tx);
+        if (next) {
+          set(next as Partial<InternalStore>);
+        }
+      });
+      return;
+    }
     set((store) => {
       const normalizedTime = normalizeTimelineTime(newTime);
       const tx = createTransaction('move_event_time', {
@@ -657,8 +1133,40 @@ export const useWhiteboardStore = create<InternalStore>((set, get) => ({
   },
 
   splitSelectedSegmentAt: (time) => {
-    const store = get();
+    const initialStore = get();
     const splitTime = normalizeTimelineTime(time);
+    const targetSegment = resolveSplitTarget(
+      initialStore.timelineSegments,
+      splitTime,
+      initialStore.selectedSegmentId,
+    );
+    if (!targetSegment) {
+      return false;
+    }
+    if (hasNativeTimelineRuntime()) {
+      enqueueNativeMutation(async () => {
+        const store = get();
+        const tx = createTransaction('split_at', {
+          time: splitTime,
+          selectedSegmentId: store.selectedSegmentId ?? null,
+        });
+        const next = await applyTimelineCommandWithTransactionAsync(store, {
+          kind: 'split_at',
+          time: splitTime,
+          selectedSegmentId: store.selectedSegmentId,
+        }, tx);
+        if (!next) {
+          return;
+        }
+        const selectedSegmentId = next.timelineSegments?.find((segment) => segment.startTime === splitTime)?.id;
+        set({
+          ...next,
+          selectedSegmentId: selectedSegmentId ?? next.selectedSegmentId,
+        } as Partial<InternalStore>);
+      });
+      return true;
+    }
+    const store = get();
     const tx = createTransaction('split_at', {
       time: splitTime,
       selectedSegmentId: store.selectedSegmentId ?? null,
@@ -691,10 +1199,7 @@ export const useWhiteboardStore = create<InternalStore>((set, get) => ({
           segment.sourceDurationMs
             ?? Math.max(1, normalizeTimelineTime(segment.endTime) - normalizeTimelineTime(segment.startTime)),
         ),
-        waveform:
-          segment.waveform.length > 0
-            ? segment.waveform
-            : createMockWaveform(segment.startTime, segment.endTime),
+        waveform: segment.waveform,
       };
 
       if (normalized.endTime <= normalized.startTime) {
@@ -729,6 +1234,41 @@ export const useWhiteboardStore = create<InternalStore>((set, get) => ({
   },
 
   insertGap: (start, duration, options) => {
+    if (hasNativeTimelineRuntime()) {
+      enqueueNativeMutation(async () => {
+        const safeDuration = Math.max(0, Math.trunc(duration));
+        if (safeDuration <= 0) {
+          return;
+        }
+        const normalizedStart = normalizeTimelineTime(start);
+        const store = get();
+        const tx = createTransaction('insert_gap', {
+          start: normalizedStart,
+          duration: safeDuration,
+          eventIdsCount: options?.eventIds?.length ?? 0,
+          audioIdsCount: options?.audioIds?.length ?? 0,
+        });
+        const next = await applyTimelineCommandWithTransactionAsync(
+          store,
+          {
+            kind: 'insert_gap',
+            start: normalizedStart,
+            duration: safeDuration,
+            eventIds: options?.eventIds,
+            audioIds: options?.audioIds,
+          },
+          tx,
+          {
+            historyMode: (options?.pushHistory ?? true) ? 'always' : 'never',
+            setLastTransaction: options?.pushHistory ?? true,
+          },
+        );
+        if (next) {
+          set(next as Partial<InternalStore>);
+        }
+      });
+      return;
+    }
     set((store) => {
       const safeDuration = Math.max(0, Math.trunc(duration));
       if (safeDuration <= 0) {
@@ -791,6 +1331,25 @@ export const useWhiteboardStore = create<InternalStore>((set, get) => ({
   },
 
   setProjectPages: (pages, options) => {
+    if (hasNativeTimelineRuntime()) {
+      enqueueNativeMutation(async () => {
+        const store = get();
+        const basePages = options?.replace
+          ? []
+          : [...store.project.pages];
+        const mergedById = new Map<string, ProjectPage>();
+        for (const page of basePages) {
+          mergedById.set(page.id, page);
+        }
+        for (const page of pages) {
+          mergedById.set(page.id, page);
+        }
+        const nextPages = normalizeProjectPages([...mergedById.values()]);
+        const next = await applyProjectPagesTimelineAsync(store, nextPages, options);
+        set(next as Partial<InternalStore>);
+      });
+      return;
+    }
     set((store) => {
       const basePages = options?.replace
         ? []
@@ -804,38 +1363,7 @@ export const useWhiteboardStore = create<InternalStore>((set, get) => ({
       }
       const nextPages = normalizeProjectPages([...mergedById.values()]);
 
-      const switchToPageId = options?.switchToPageId;
-      const shouldSwitch = !!switchToPageId && switchToPageId !== store.state.currentPageId;
-      const nextEvents = shouldSwitch
-        ? insertEvent(store.events, {
-          id: generateId('evt'),
-          projectId: DEFAULT_PROJECT_ID,
-          pageId: store.state.currentPageId,
-          actorId: 'local-actor',
-          time: store.currentTime,
-          type: TimelineEventType.PAGE_SET,
-          targetId: switchToPageId,
-          payload: { pageId: switchToPageId },
-        })
-        : store.events;
-
-      const timeline = applyTimeline(
-        nextEvents,
-        store.currentTime,
-        {
-          ...store.project,
-          pages: nextPages,
-          updatedAt: options?.touchUpdatedAt === false
-            ? store.project.updatedAt
-            : new Date().toISOString(),
-        },
-        store.audioSegments,
-      );
-
-      return {
-        ...timeline,
-        recordingStatus: store.recordingStatus,
-      };
+      return applyProjectPagesTimeline(store, nextPages, options);
     });
   },
 
@@ -907,6 +1435,28 @@ export const useWhiteboardStore = create<InternalStore>((set, get) => ({
   },
 
   deleteProjectPage: (pageId) => {
+    if (hasNativeTimelineRuntime()) {
+      enqueueNativeMutation(async () => {
+        const store = get();
+        if (store.project.pages.length <= 1) {
+          return;
+        }
+
+        const currentSorted = [...store.project.pages].sort((a, b) => a.order - b.order);
+        const currentIndex = currentSorted.findIndex((page) => page.id === pageId);
+        if (currentIndex < 0) {
+          return;
+        }
+
+        const nextPages = normalizeProjectPages(currentSorted.filter((page) => page.id !== pageId));
+        const fallbackPageId = nextPages[Math.max(0, Math.min(currentIndex, nextPages.length - 1))]?.id;
+        const next = await applyProjectPagesTimelineAsync(store, nextPages, {
+          switchToPageId: fallbackPageId,
+        });
+        set(next as Partial<InternalStore>);
+      });
+      return;
+    }
     set((store) => {
       if (store.project.pages.length <= 1) {
         return {};
@@ -920,35 +1470,9 @@ export const useWhiteboardStore = create<InternalStore>((set, get) => ({
 
       const nextPages = normalizeProjectPages(currentSorted.filter((page) => page.id !== pageId));
       const fallbackPageId = nextPages[Math.max(0, Math.min(currentIndex, nextPages.length - 1))]?.id;
-      const shouldSwitch = !!fallbackPageId && fallbackPageId !== store.state.currentPageId;
-      const nextEvents = shouldSwitch
-        ? insertEvent(store.events, {
-          id: generateId('evt'),
-          projectId: DEFAULT_PROJECT_ID,
-          pageId: store.state.currentPageId,
-          actorId: 'local-actor',
-          time: store.currentTime,
-          type: TimelineEventType.PAGE_SET,
-          targetId: fallbackPageId,
-          payload: { pageId: fallbackPageId },
-        })
-        : store.events;
-
-      const timeline = applyTimeline(
-        nextEvents,
-        store.currentTime,
-        {
-          ...store.project,
-          pages: nextPages,
-          updatedAt: new Date().toISOString(),
-        },
-        store.audioSegments,
-      );
-
-      return {
-        ...timeline,
-        recordingStatus: store.recordingStatus,
-      };
+      return applyProjectPagesTimeline(store, nextPages, {
+        switchToPageId: fallbackPageId,
+      });
     });
   },
 

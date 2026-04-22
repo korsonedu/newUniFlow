@@ -795,4 +795,29 @@ mod tests {
         assert_eq!(split.left.len(), 2);
         assert_eq!(right_times, vec![350]);
     }
+
+    #[test]
+    fn delete_time_range_removes_middle_events() {
+        let events = vec![
+            make_event("e1", TimelineEventType::ViewportSet, 100),
+            make_event("e2", TimelineEventType::ViewportSet, 260),
+            make_event("e3", TimelineEventType::ViewportSet, 480),
+        ];
+        let next = delete_time_range(&events, 120, 300);
+        let ids = next.iter().map(|event| event.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(ids, vec!["e1", "e3"]);
+    }
+
+    #[test]
+    fn insert_time_gap_shifts_only_selected_events() {
+        let events = vec![
+            make_event("e1", TimelineEventType::ViewportSet, 100),
+            make_event("e2", TimelineEventType::ViewportSet, 260),
+            make_event("e3", TimelineEventType::ViewportSet, 480),
+        ];
+        let next = insert_time_gap(&events, 220, 120, Some(&["e3".to_string()]));
+        let times = next.iter().map(|event| event.time).collect::<Vec<_>>();
+        assert_eq!(times, vec![100, 260, 600]);
+        assert_eq!(timeline_max_time(&next), 600);
+    }
 }

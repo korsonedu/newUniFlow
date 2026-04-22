@@ -215,17 +215,38 @@ const sanitizeStrokePointTimes = (
   return normalized;
 };
 
+const sanitizeStrokePointPressures = (
+  points: Stroke['points'],
+  rawPressures: unknown,
+): number[] | undefined => {
+  if (points.length === 0) {
+    return undefined;
+  }
+  const source = asNumberList(rawPressures);
+  if (source.length !== points.length) {
+    return undefined;
+  }
+  return source.map((value) => Math.max(0, Math.min(1, value)));
+};
+
+const sanitizeStrokeKind = (value: unknown): Stroke['kind'] | undefined => {
+  return value === 'pen' || value === 'highlight' ? value : undefined;
+};
+
 const applyStrokeCreate: PageEventHandler = (page, event) => {
   const payload = asObject(event.payload) as StrokeCreatePayload;
   const strokeId = event.targetId ?? payload.id ?? event.id;
   const createdAt = toTimelineTime(event.time);
   const points = Array.isArray(payload.points) ? payload.points : [];
   const pointTimes = sanitizeStrokePointTimes(points, payload.pointTimes, createdAt);
+  const pointPressures = sanitizeStrokePointPressures(points, payload.pointPressures);
 
   const stroke: Stroke = {
     id: strokeId,
     points,
     pointTimes,
+    pointPressures,
+    kind: sanitizeStrokeKind(payload.kind),
     color: typeof payload.color === 'string' ? payload.color : '#111111',
     width: typeof payload.width === 'number' ? payload.width : 2,
     createdAt,

@@ -37,6 +37,8 @@ export type Stroke = {
   id: string;
   points: Point[];
   pointTimes?: number[];
+  pointPressures?: number[];
+  kind?: 'pen' | 'highlight';
   color: string;
   width: number;
   createdAt: number;
@@ -140,6 +142,8 @@ export type StrokeCreatePayload = {
   id?: string;
   points: Point[];
   pointTimes?: number[];
+  pointPressures?: number[];
+  kind?: 'pen' | 'highlight';
   color?: string;
   width?: number;
 };

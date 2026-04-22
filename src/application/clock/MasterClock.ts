@@ -1,4 +1,5 @@
 import { normalizeTimelineTime } from '../../domain/time';
+import { platformNowMs } from '../../infrastructure/platform/frameScheduler';
 
 export type ReplayDriver = {
   play: () => void;
@@ -28,6 +29,8 @@ type MasterClockOptions = {
   nowMs?: () => number;
 };
 
+const PLAYBACK_PREPARE_WINDOW_MS = 12_000;
+
 export class MasterClock {
   private deps: MasterClockDeps | null = null;
   private readonly getWallNowMs: () => number;
@@ -39,12 +42,7 @@ export class MasterClock {
   private static readonly DRIFT_CORRECTION_MIN_INTERVAL_MS = 250;
 
   constructor(options?: MasterClockOptions) {
-    this.getWallNowMs = options?.nowMs ?? (() => {
-      if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
-        return performance.now();
-      }
-      return Date.now();
-    });
+    this.getWallNowMs = options?.nowMs ?? platformNowMs;
   }
 
   configure(deps: MasterClockDeps): void {
@@ -79,14 +77,14 @@ export class MasterClock {
 
     if (audio) {
       await audio.unlock();
-      await audio.prepare(currentTime, 8000);
+      await audio.prepare(currentTime, PLAYBACK_PREPARE_WINDOW_MS);
     }
 
     if (currentTime >= Math.max(0, maxTime - 1)) {
       replay.seek(0);
       deps.syncAt(0, false);
       if (audio) {
-        await audio.prepare(0, 8000);
+        await audio.prepare(0, PLAYBACK_PREPARE_WINDOW_MS);
       }
     }
 
@@ -94,6 +92,7 @@ export class MasterClock {
     replay.play();
     const syncedTime = normalizeTimelineTime(deps.getCurrentTime());
     deps.syncAt(syncedTime, true);
+    this.resetDriftCorrectionWindow();
     this.resetPlayAnchor(syncedTime);
     deps.setPlaying(true);
   }
@@ -107,6 +106,7 @@ export class MasterClock {
     replay?.pause();
     deps.syncAt(normalizeTimelineTime(deps.getCurrentTime()), false);
     this.clearPlayAnchor();
+    this.resetDriftCorrectionWindow();
     deps.setPlaying(false);
   }
 
@@ -121,11 +121,14 @@ export class MasterClock {
       return;
     }
     replay.seek(t);
+    void this.deps?.getAudio()?.prepare(t, PLAYBACK_PREPARE_WINDOW_MS);
     deps.syncAt(t, replay.isPlaying());
     if (replay.isPlaying()) {
+      this.resetDriftCorrectionWindow();
       this.resetPlayAnchor(t);
     } else {
       this.clearPlayAnchor();
+      this.resetDriftCorrectionWindow();
     }
     if (!replay.isPlaying()) {
       deps.setPlaying(false);
@@ -162,6 +165,7 @@ export class MasterClock {
       return;
     }
 
+    void audio.prepare(currentTimeline, PLAYBACK_PREPARE_WINDOW_MS);
     deps.syncAt(currentTimeline, true);
     this.lastDriftCorrectionWallMs = nowWall;
     this.resetPlayAnchor(currentTimeline);
@@ -180,5 +184,9 @@ export class MasterClock {
   private clearPlayAnchor(): void {
     this.playAnchorTimelineMs = null;
     this.playAnchorAudioClockMs = null;
+  }
+
+  private resetDriftCorrectionWindow(): void {
+    this.lastDriftCorrectionWallMs = 0;
   }
 }

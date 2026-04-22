@@ -1,3 +1,5 @@
+import { platformClearTimeout, platformSetTimeout } from './timer';
+
 let fallbackFrameId = 1;
 const fallbackTimers = new Map<number, ReturnType<typeof setTimeout>>();
 
@@ -15,7 +17,7 @@ export const requestPlatformFrame = (callback: FrameRequestCallback): number => 
 
   const id = fallbackFrameId;
   fallbackFrameId += 1;
-  const timer = setTimeout(() => {
+  const timer = platformSetTimeout(() => {
     fallbackTimers.delete(id);
     callback(platformNowMs());
   }, 16);
@@ -33,6 +35,6 @@ export const cancelPlatformFrame = (id: number): void => {
   if (!timer) {
     return;
   }
-  clearTimeout(timer);
+  platformClearTimeout(timer);
   fallbackTimers.delete(id);
 };

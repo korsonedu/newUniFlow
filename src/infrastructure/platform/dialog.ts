@@ -1,3 +1,8 @@
+import {
+  appendElementToBody,
+  createFileInputElement,
+} from './domFactory';
+
 export type OpenFileDialogOptions = {
   accept?: string;
   multiple?: boolean;
@@ -157,14 +162,21 @@ export const openFileDialog = async (
     }
   }
   return new Promise<File[]>((resolve) => {
-    const input = document.createElement('input');
+    const input = createFileInputElement();
+    if (!input) {
+      resolve([]);
+      return;
+    }
     input.type = 'file';
     input.accept = options.accept ?? '';
     input.multiple = !!options.multiple;
     input.style.position = 'fixed';
     input.style.left = '-9999px';
     input.style.opacity = '0';
-    document.body.appendChild(input);
+    if (!appendElementToBody(input)) {
+      resolve([]);
+      return;
+    }
 
     const cleanup = () => {
       input.remove();

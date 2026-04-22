@@ -1,6 +1,11 @@
 import { AudioSegment, TimelineEvent, WaveformPoint } from '../domain/types';
 import { sortEvents } from '../engine/timelineEngine';
 import { normalizeTimelineTime } from '../domain/time';
+import {
+  readBrowserStorageItem,
+  removeBrowserStorageItem,
+  writeBrowserStorageItem,
+} from '../infrastructure/platform/browserStorage';
 
 export const SNAPSHOT_VERSION = 1;
 export const SNAPSHOT_STORAGE_KEY = 'uniflow.timeline.snapshot.v1';
@@ -122,41 +127,17 @@ export const parseSnapshotJson = (json: string): WhiteboardSnapshot | null => {
 };
 
 export const loadSnapshotFromStorage = (): WhiteboardSnapshot | null => {
-  if (typeof window === 'undefined') {
+  const raw = readBrowserStorageItem(SNAPSHOT_STORAGE_KEY);
+  if (!raw) {
     return null;
   }
-
-  try {
-    const raw = window.localStorage.getItem(SNAPSHOT_STORAGE_KEY);
-    if (!raw) {
-      return null;
-    }
-    return parseSnapshotJson(raw);
-  } catch {
-    return null;
-  }
+  return parseSnapshotJson(raw);
 };
 
 export const saveSnapshotToStorage = (snapshot: WhiteboardSnapshot): void => {
-  if (typeof window === 'undefined') {
-    return;
-  }
-
-  try {
-    window.localStorage.setItem(SNAPSHOT_STORAGE_KEY, snapshotToJson(snapshot));
-  } catch {
-    // ignore quota / privacy mode failures
-  }
+  writeBrowserStorageItem(SNAPSHOT_STORAGE_KEY, snapshotToJson(snapshot));
 };
 
 export const clearSnapshotStorage = (): void => {
-  if (typeof window === 'undefined') {
-    return;
-  }
-
-  try {
-    window.localStorage.removeItem(SNAPSHOT_STORAGE_KEY);
-  } catch {
-    // ignore
-  }
+  removeBrowserStorageItem(SNAPSHOT_STORAGE_KEY);
 };

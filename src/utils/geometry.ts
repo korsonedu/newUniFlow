@@ -38,35 +38,34 @@ export const hitStroke = (point: Point, stroke: Stroke, threshold = 8): boolean 
   return false;
 };
 
+export const rotatePoint = (point: Point, center: Point, degrees: number): Point => {
+  const radians = (degrees * Math.PI) / 180;
+  const cos = Math.cos(radians);
+  const sin = Math.sin(radians);
+  const dx = point.x - center.x;
+  const dy = point.y - center.y;
+  return {
+    x: center.x + ((dx * cos) - (dy * sin)),
+    y: center.y + ((dx * sin) + (dy * cos)),
+  };
+};
+
+export const getRectCenter = (object: Pick<WhiteboardObject, 'x' | 'y' | 'width' | 'height'>): Point => ({
+  x: object.x + (object.width / 2),
+  y: object.y + (object.height / 2),
+});
+
 export const hitRectObject = (point: Point, object: WhiteboardObject): boolean => {
+  const rotation = object.rotation ?? 0;
+  const normalizedPoint = rotation === 0
+    ? point
+    : rotatePoint(point, getRectCenter(object), -rotation);
   const left = Math.min(object.x, object.x + object.width);
   const right = Math.max(object.x, object.x + object.width);
   const top = Math.min(object.y, object.y + object.height);
   const bottom = Math.max(object.y, object.y + object.height);
-  return point.x >= left && point.x <= right && point.y >= top && point.y <= bottom;
-};
-
-export const pointsToSvgPath = (points: Point[]): string => {
-  if (points.length === 0) {
-    return '';
-  }
-  if (points.length === 1) {
-    const p = points[0];
-    return `M ${p.x} ${p.y} L ${p.x + 0.1} ${p.y + 0.1}`;
-  }
-  if (points.length === 2) {
-    return `M ${points[0].x} ${points[0].y} L ${points[1].x} ${points[1].y}`;
-  }
-
-  let path = `M ${points[0].x} ${points[0].y}`;
-  for (let i = 1; i < points.length - 1; i += 1) {
-    const current = points[i];
-    const next = points[i + 1];
-    const midX = (current.x + next.x) / 2;
-    const midY = (current.y + next.y) / 2;
-    path += ` Q ${current.x} ${current.y} ${midX} ${midY}`;
-  }
-  const last = points[points.length - 1];
-  path += ` L ${last.x} ${last.y}`;
-  return path;
+  return normalizedPoint.x >= left
+    && normalizedPoint.x <= right
+    && normalizedPoint.y >= top
+    && normalizedPoint.y <= bottom;
 };

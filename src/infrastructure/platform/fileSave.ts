@@ -1,12 +1,18 @@
+import {
+  createAnchorElement,
+  createObjectUrl,
+  revokeObjectUrl,
+} from './domFactory';
+import { platformSetTimeout } from './timer';
+
 export const saveBlobWithDownload = (filename: string, blob: Blob): void => {
-  if (typeof window === 'undefined') {
+  const url = createObjectUrl(blob);
+  const link = createAnchorElement();
+  if (!url || !link) {
     return;
   }
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
   link.href = url;
   link.download = filename;
   link.click();
-  window.setTimeout(() => URL.revokeObjectURL(url), 1200);
+  platformSetTimeout(() => revokeObjectUrl(url), 1200);
 };
-

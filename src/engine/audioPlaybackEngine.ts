@@ -1,6 +1,7 @@
 import { AudioSegment } from '../domain/types';
 import { normalizeTimelineTime } from '../domain/time';
 import { createAudioContext } from '../infrastructure/platform/audioContext';
+import { platformNowMs } from '../infrastructure/platform/frameScheduler';
 
 type ActivePlayback = {
   source: AudioBufferSourceNode;
@@ -9,6 +10,42 @@ type ActivePlayback = {
 };
 
 const DRIFT_RESTART_THRESHOLD_SEC = 0.2;
+const DRIFT_RESTART_COOLDOWN_SEC = 0.12;
+const DRIFT_RESTART_FORCE_THRESHOLD_SEC = 0.45;
+const SYNC_PREPARE_WINDOW_MS = 12_000;
+const SYNC_PREPARE_REFRESH_THRESHOLD_MS = 2_000;
+
+export const shouldRestartActivePlayback = (
+  estimatedOffsetSec: number,
+  desiredOffsetSec: number,
+  sinceStartSec: number,
+): boolean => {
+  const driftSec = Math.abs(estimatedOffsetSec - desiredOffsetSec);
+  if (driftSec <= DRIFT_RESTART_THRESHOLD_SEC) {
+    return false;
+  }
+  if (
+    sinceStartSec < DRIFT_RESTART_COOLDOWN_SEC
+    && driftSec <= DRIFT_RESTART_FORCE_THRESHOLD_SEC
+  ) {
+    return false;
+  }
+  return true;
+};
+
+export const shouldRefreshPlaybackPreparation = (
+  currentTimeMs: number,
+  preparedWindowStartMs: number | null,
+  preparedWindowEndMs: number | null,
+): boolean => {
+  if (preparedWindowStartMs === null || preparedWindowEndMs === null) {
+    return true;
+  }
+  if (currentTimeMs < preparedWindowStartMs) {
+    return true;
+  }
+  return currentTimeMs + SYNC_PREPARE_REFRESH_THRESHOLD_MS >= preparedWindowEndMs;
+};
 
 export class AudioPlaybackEngine {
   private context: AudioContext | null = null;
@@ -21,11 +58,15 @@ export class AudioPlaybackEngine {
   private readonly bufferCache = new Map<string, AudioBuffer>();
   private readonly loadingCache = new Map<string, Promise<AudioBuffer | null>>();
   private readonly activePlaybacks = new Map<string, ActivePlayback>();
+  private preparedWindowStartMs: number | null = null;
+  private preparedWindowEndMs: number | null = null;
 
   setSegments(segments: AudioSegment[]): void {
     this.segments = segments
       .filter((segment) => !!segment.sourceUrl && !segment.muted)
       .map((segment) => ({ ...segment }));
+    this.preparedWindowStartMs = null;
+    this.preparedWindowEndMs = null;
 
     const validIds = new Set(this.segments.map((segment) => segment.id));
     for (const id of [...this.activePlaybacks.keys()]) {
@@ -99,7 +140,7 @@ export class AudioPlaybackEngine {
 
   getClockNowMs(): number {
     if (!this.context) {
-      return performance.now();
+      return platformNowMs();
     }
     return this.context.currentTime * 1000;
   }
@@ -130,6 +171,7 @@ export class AudioPlaybackEngine {
     }
 
     const safeTime = normalizeTimelineTime(time);
+    this.refreshPlaybackPreparationWindow(safeTime);
     const compensatedTimeSec = safeTime / 1000;
     const shouldBeActive = new Set<string>();
 
@@ -174,7 +216,7 @@ export class AudioPlaybackEngine {
 
       const elapsedSec = Math.max(0, context.currentTime - active.startedAtContext);
       const estimatedOffset = active.startedOffset + elapsedSec;
-      if (Math.abs(estimatedOffset - desiredOffsetSec) > DRIFT_RESTART_THRESHOLD_SEC) {
+      if (shouldRestartActivePlayback(estimatedOffset, desiredOffsetSec, elapsedSec)) {
         this.startSegment(
           segment.id,
           buffer,
@@ -339,6 +381,21 @@ export class AudioPlaybackEngine {
       return null;
     }
     return this.bufferCache.get(sourceUrl) ?? null;
+  }
+
+  private refreshPlaybackPreparationWindow(currentTimeMs: number): void {
+    if (
+      !shouldRefreshPlaybackPreparation(
+        currentTimeMs,
+        this.preparedWindowStartMs,
+        this.preparedWindowEndMs,
+      )
+    ) {
+      return;
+    }
+    this.preparedWindowStartMs = normalizeTimelineTime(currentTimeMs);
+    this.preparedWindowEndMs = normalizeTimelineTime(currentTimeMs + SYNC_PREPARE_WINDOW_MS);
+    void this.prepare(currentTimeMs, SYNC_PREPARE_WINDOW_MS);
   }
 
   private getSourceDurationSec(

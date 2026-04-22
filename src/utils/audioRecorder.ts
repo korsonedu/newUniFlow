@@ -2,6 +2,8 @@ import {
   createAudioContext,
   isAudioContextSupported,
 } from '../infrastructure/platform/audioContext';
+import { createAudioElement } from '../infrastructure/platform/domFactory';
+import { platformNowMs } from '../infrastructure/platform/frameScheduler';
 
 export type RecorderState = 'inactive' | 'recording' | 'paused';
 export type RecorderKind = 'media-recorder' | 'pcm-fallback';
@@ -30,7 +32,7 @@ const preferredMimeType = (): string | undefined => {
   if (typeof MediaRecorder === 'undefined') {
     return undefined;
   }
-  const audioEl = typeof document !== 'undefined' ? document.createElement('audio') : null;
+  const audioEl = createAudioElement();
   const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'];
   for (const mimeType of candidates) {
     const recorderSupported = MediaRecorder.isTypeSupported(mimeType);
@@ -125,7 +127,7 @@ const createMediaRecorderAdapter = (
   let accumulatedMs = 0;
   let activeStartedAt = 0;
 
-  const nowMs = () => performance.now();
+  const nowMs = () => platformNowMs();
 
   const beginActiveTimer = () => {
     if (activeStartedAt <= 0) {
@@ -256,7 +258,7 @@ const createPcmFallbackAdapter = (stream: MediaStream): RecorderAdapter | null =
   let capturedSamples = 0;
   let accumulatedMs = 0;
   let activeStartedAt = 0;
-  const nowMs = () => performance.now();
+  const nowMs = () => platformNowMs();
 
   const beginActiveTimer = () => {
     if (activeStartedAt <= 0) {
@@ -407,18 +409,18 @@ export const detectRecordingSupport = (): RecordingSupportInfo => {
 
 export const createRecorderAdapter = (stream: MediaStream): RecorderAdapter | null => {
   try {
-    const pcm = createPcmFallbackAdapter(stream);
-    if (pcm) {
-      return pcm;
-    }
-  } catch {
-    // fallback to MediaRecorder adapter below
-  }
-
-  try {
     const media = createMediaRecorderAdapter(stream, preferredMimeType());
     if (media) {
       return media;
+    }
+  } catch {
+    // fallback to PCM adapter below
+  }
+
+  try {
+    const pcm = createPcmFallbackAdapter(stream);
+    if (pcm) {
+      return pcm;
     }
   } catch {
     return null;

@@ -24,6 +24,69 @@ import { useExportJobStore } from './store/useExportJobStore';
 import { getExportTimelineStats } from './application/export/exportTimelineConsistency';
 import { openFileDialog } from './infrastructure/platform/dialog';
 import { RecordingOverlay } from './components/recording/RecordingOverlay';
+import {
+  addBlankProjectPage,
+  createProjectRecord,
+  deleteProjectLibraryRecord,
+  deleteProjectPage as deleteProjectPageFromLibrary,
+  deleteSelectedProjectPages,
+  duplicateProjectPage as duplicateProjectPageInLibrary,
+  duplicateProjectLibraryRecord,
+  duplicateSelectedProjectPages,
+  formatProjectTime,
+  moveProjectPage,
+  normalizeProjectRecordPages,
+  ProjectRecord,
+  renameProjectLibraryRecord,
+  updateProjectRecordInLibrary,
+  updateProjectPagesInLibrary,
+  upsertProjectRecord,
+} from './application/projects/projectLibrary';
+import {
+  deriveCreateProjectDialogPresentation,
+  deriveCanDeleteSelectedPages,
+  deriveExportQueuePresentation,
+  deriveRecordingOverlayPresentation,
+  resolvePageManagerProjectId,
+} from './application/projects/projectWorkspacePresentation';
+import type { CreateProjectMode } from './application/projects/projectWorkspacePresentation';
+import {
+  createInitialProjectShellState,
+} from './application/projects/projectShellState';
+import {
+  beginProjectRenameCommand,
+  cancelProjectRenameCommand,
+  clearProjectPageSelectionCommand,
+  closeCreateProjectDialogCommand,
+  closeProjectPageManagerCommand,
+  dismissExportMenuCommand,
+  finishCreateProjectCommand,
+  openCreateProjectDialogCommand,
+  selectAllProjectPagesCommand,
+  setCreateProjectAuthorCommand,
+  setCreateProjectFileCommand,
+  setCreateProjectModeCommand,
+  setCreateProjectNameCommand,
+  setCreateProjectPendingCommand,
+  syncPageManagerProjectCommand,
+  syncPageManagerSelectionCommand,
+  toggleExportMenuCommand,
+  toggleProjectPageManagerCommand,
+  toggleProjectPageSelectionCommand,
+  updateProjectRenameDraftCommand,
+} from './application/projects/projectShellCommands';
+import { loadProjectLibraryState, saveProjectLibraryState } from './infrastructure/platform/projectLibraryStorage';
+import {
+  combineWindowEventDisposers,
+  subscribeWindowEscape,
+  subscribeWindowPointerDown,
+} from './infrastructure/platform/windowEvents';
+import {
+  platformClearTimeout,
+  platformSetTimeout,
+  PlatformTimerHandle,
+} from './infrastructure/platform/timer';
+import { isNativeMacDesktop } from './infrastructure/platform/runtime';
 
 const WhiteboardCanvas = lazy(() =>
   import('./components/canvas/WhiteboardCanvas').then((module) => ({ default: module.WhiteboardCanvas })));
@@ -31,20 +94,7 @@ const TimelineEditor = lazy(() =>
   import('./components/timeline/TimelineEditor').then((module) => ({ default: module.TimelineEditor })));
 
 type AppLayer = 'project' | 'recording';
-type CreateProjectMode = 'blank' | 'file';
 
-type ProjectRecord = {
-  id: string;
-  name: string;
-  author?: string;
-  createdAt: string;
-  updatedAt: string;
-  snapshotJson: string;
-  projectPages: ProjectPage[];
-};
-
-const PROJECTS_STORAGE_KEY = 'uniflow.projects.v1';
-const ACTIVE_PROJECT_STORAGE_KEY = 'uniflow.projects.active.v1';
 const UFPROJ_ACCEPT = '.ufproj';
 const COURSEWARE_ACCEPT = [
   '.pdf',
@@ -65,128 +115,9 @@ const CURRENT_USER_NAME = 'Teacher Guest';
 const CURRENT_USER_HANDLE = '@uniflow.local';
 const CURRENT_LICENSE = 'DEV LICENSE';
 
-const loadProjectsFromStorage = (): ProjectRecord[] => {
-  if (typeof window === 'undefined') {
-    return [];
-  }
-  try {
-    const raw = window.localStorage.getItem(PROJECTS_STORAGE_KEY);
-    if (!raw) {
-      return [];
-    }
-    const parsed = JSON.parse(raw) as unknown;
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-    return parsed
-      .filter((item): item is ProjectRecord => {
-        if (!item || typeof item !== 'object') {
-          return false;
-        }
-        const row = item as Record<string, unknown>;
-        return (
-          typeof row.id === 'string'
-          && typeof row.name === 'string'
-          && typeof row.createdAt === 'string'
-          && typeof row.updatedAt === 'string'
-          && typeof row.snapshotJson === 'string'
-        );
-      })
-      .filter((row) => !!parseSnapshotJson(row.snapshotJson))
-      .map((row) => ({
-        ...row,
-        author: typeof (row as unknown as Record<string, unknown>).author === 'string'
-          ? (row as unknown as Record<string, string>).author
-          : undefined,
-        projectPages: parseProjectPages((row as unknown as Record<string, unknown>).projectPages),
-      }));
-  } catch {
-    return [];
-  }
-};
-
-const loadActiveProjectId = (): string | null => {
-  if (typeof window === 'undefined') {
-    return null;
-  }
-  try {
-    return window.localStorage.getItem(ACTIVE_PROJECT_STORAGE_KEY);
-  } catch {
-    return null;
-  }
-};
-
-const persistProjects = (projects: ProjectRecord[], activeProjectId: string | null): void => {
-  if (typeof window === 'undefined') {
-    return;
-  }
-  try {
-    window.localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(projects));
-    if (activeProjectId) {
-      window.localStorage.setItem(ACTIVE_PROJECT_STORAGE_KEY, activeProjectId);
-    } else {
-      window.localStorage.removeItem(ACTIVE_PROJECT_STORAGE_KEY);
-    }
-  } catch {
-    // ignore quota/privacy errors
-  }
-};
-
 const sanitizeFilename = (name: string): string => {
   const cleaned = name.trim().replace(/[\\/:*?"<>|]+/g, '-');
   return cleaned.length > 0 ? cleaned : 'uniflow-project';
-};
-
-const normalizeRecordPages = (pages: ProjectPage[]): ProjectPage[] => {
-  return pages
-    .map((page, index) => ({
-      ...page,
-      name: `Page ${index + 1}`,
-      order: index,
-    }))
-    .sort((a, b) => a.order - b.order)
-    .map((page, index) => ({
-      ...page,
-      order: index,
-    }));
-};
-
-const parseProjectPages = (value: unknown): ProjectPage[] => {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  const parsed = value
-    .filter((item): item is ProjectPage => {
-      if (!item || typeof item !== 'object') {
-        return false;
-      }
-      const row = item as Record<string, unknown>;
-      return (
-        typeof row.id === 'string'
-        && typeof row.name === 'string'
-        && typeof row.assetType === 'string'
-        && typeof row.order === 'number'
-      );
-    })
-    .map((page) => ({
-      ...page,
-      width: typeof page.width === 'number' ? page.width : undefined,
-      height: typeof page.height === 'number' ? page.height : undefined,
-      sourceName: typeof page.sourceName === 'string' ? page.sourceName : undefined,
-      sourcePageIndex: typeof page.sourcePageIndex === 'number' ? page.sourcePageIndex : undefined,
-      backgroundUrl: typeof page.backgroundUrl === 'string' ? page.backgroundUrl : undefined,
-      backgroundAssetKey: typeof page.backgroundAssetKey === 'string' ? page.backgroundAssetKey : undefined,
-      thumbnailUrl: typeof page.thumbnailUrl === 'string' ? page.thumbnailUrl : undefined,
-    }));
-  return normalizeRecordPages(parsed);
-};
-
-const formatProjectTime = (iso: string): string => {
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) {
-    return '';
-  }
-  return date.toLocaleString();
 };
 
 const isUfprojFile = (file: File): boolean => {
@@ -194,6 +125,8 @@ const isUfprojFile = (file: File): boolean => {
 };
 
 const App: React.FC = () => {
+  const initialLibraryState = useMemo(() => loadProjectLibraryState(), []);
+  const initialShellState = useMemo(() => createInitialProjectShellState(), []);
   const exportSnapshotJson = useWhiteboardStore((s) => s.exportSnapshotJson);
   const importSnapshotJson = useWhiteboardStore((s) => s.importSnapshotJson);
   const resetProject = useWhiteboardStore((s) => s.resetProject);
@@ -204,22 +137,14 @@ const App: React.FC = () => {
   const recordingStatus = useWhiteboardStore((s) => s.recordingStatus);
   const currentProjectTitle = useWhiteboardStore((s) => s.project.title);
   const currentProjectPages = useWhiteboardStore((s) => s.project.pages);
+  const currentPageId = useWhiteboardStore((s) => s.state.currentPageId);
 
   const [layer, setLayer] = useState<AppLayer>('project');
-  const [projects, setProjects] = useState<ProjectRecord[]>(() => loadProjectsFromStorage());
-  const [activeProjectId, setActiveProjectId] = useState<string | null>(() => loadActiveProjectId());
-  const [showCreateProjectForm, setShowCreateProjectForm] = useState(false);
-  const [createProjectMode, setCreateProjectMode] = useState<CreateProjectMode>('blank');
-  const [newProjectName, setNewProjectName] = useState('');
-  const [newProjectAuthor, setNewProjectAuthor] = useState('');
-  const [newProjectFile, setNewProjectFile] = useState<File | null>(null);
-  const [creatingProject, setCreatingProject] = useState(false);
+  const [projects, setProjects] = useState<ProjectRecord[]>(initialLibraryState.projects);
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(initialLibraryState.activeProjectId);
   const [coursewareBusy, setCoursewareBusy] = useState(false);
-  const [exportMenuOpen, setExportMenuOpen] = useState(false);
-  const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
-  const [editingProjectName, setEditingProjectName] = useState('');
-  const [pageManagerProjectId, setPageManagerProjectId] = useState<string | null>(null);
-  const [pageManagerSelectedPageIds, setPageManagerSelectedPageIds] = useState<string[]>([]);
+  const [shellState, setShellState] = useState(initialShellState);
+  const nativeMacDesktop = useMemo(() => isNativeMacDesktop(), []);
 
   const exportMenuRef = useRef<HTMLDivElement>(null);
   const activeProject = useMemo(
@@ -227,11 +152,15 @@ const App: React.FC = () => {
     [projects, activeProjectId],
   );
   const pageManagerProject = useMemo(
-    () => projects.find((project) => project.id === pageManagerProjectId) ?? null,
-    [projects, pageManagerProjectId],
+    () => projects.find((project) => project.id === shellState.pageManagerProjectId) ?? null,
+    [projects, shellState.pageManagerProjectId],
+  );
+  const activeProjectPage = useMemo(
+    () => currentProjectPages.find((page) => page.id === currentPageId) ?? currentProjectPages[0] ?? null,
+    [currentPageId, currentProjectPages],
   );
   const pageManagerPages = useMemo(
-    () => normalizeRecordPages(pageManagerProject?.projectPages ?? []),
+    () => normalizeProjectRecordPages(pageManagerProject?.projectPages ?? []),
     [pageManagerProject?.projectPages],
   );
   const exportJobs = useExportJobStore((s) => s.jobs);
@@ -243,43 +172,43 @@ const App: React.FC = () => {
   const clearFinishedExportJobs = useExportJobStore((s) => s.clearFinished);
   const removeExportJob = useExportJobStore((s) => s.removeJob);
   const setExportHudCollapsed = useExportJobStore((s) => s.setCollapsed);
-  const runningExportCount = useMemo(
-    () => exportJobs.filter((task) => task.status === 'running').length,
+  const exportQueuePresentation = useMemo(
+    () => deriveExportQueuePresentation(exportJobs),
     [exportJobs],
   );
-  const canSubmitCreateProject = useMemo(() => {
-    const hasName = newProjectName.trim().length > 0;
-    const hasRequiredFile = createProjectMode === 'blank' || !!newProjectFile;
-    return hasName && hasRequiredFile && !creatingProject;
-  }, [createProjectMode, creatingProject, newProjectFile, newProjectName]);
   const canDeleteSelectedPagesInManager = useMemo(
-    () => (
-      pageManagerSelectedPageIds.length > 0
-      && pageManagerPages.length - pageManagerSelectedPageIds.length >= 1
-    ),
-    [pageManagerPages.length, pageManagerSelectedPageIds.length],
+    () => deriveCanDeleteSelectedPages(pageManagerPages, shellState.pageManagerSelectedPageIds),
+    [pageManagerPages, shellState.pageManagerSelectedPageIds],
   );
+  const createProjectDialogPresentation = useMemo(() => deriveCreateProjectDialogPresentation({
+    ...shellState.createProjectDraft,
+  }), [shellState.createProjectDraft]);
+  const recordingOverlayPresentation = useMemo(() => deriveRecordingOverlayPresentation({
+    recordingStatus,
+    coursewareBusy,
+    currentProjectPageCount: currentProjectPages.length,
+    runningExportCount: exportQueuePresentation.runningCount,
+  }), [coursewareBusy, currentProjectPages.length, exportQueuePresentation.runningCount, recordingStatus]);
 
   useEffect(() => {
     if (projects.length > 0) {
       return;
     }
     const now = new Date().toISOString();
-    const project: ProjectRecord = {
+    const project = createProjectRecord({
       id: generateId('proj'),
       name: 'UniFlow Project',
       author: CURRENT_USER_NAME,
       createdAt: now,
-      updatedAt: now,
       snapshotJson: exportSnapshotJson(),
-      projectPages: normalizeRecordPages(useWhiteboardStore.getState().project.pages),
-    };
+      projectPages: useWhiteboardStore.getState().project.pages,
+    });
     setProjects([project]);
     setActiveProjectId(project.id);
   }, [projects.length, exportSnapshotJson]);
 
   useEffect(() => {
-    persistProjects(projects, activeProjectId);
+    saveProjectLibraryState(projects, activeProjectId);
   }, [projects, activeProjectId]);
 
   useEffect(() => {
@@ -287,7 +216,7 @@ const App: React.FC = () => {
       return;
     }
 
-    let timer: number | null = null;
+    let timer: PlatformTimerHandle | null = null;
     let lastEventsRef = useWhiteboardStore.getState().events;
     let lastAudioRef = useWhiteboardStore.getState().audioSegments;
     let lastTitleRef = useWhiteboardStore.getState().project.title;
@@ -303,7 +232,7 @@ const App: React.FC = () => {
         }
 
         const current = prev[index];
-        const nextPages = normalizeRecordPages(useWhiteboardStore.getState().project.pages);
+        const nextPages = normalizeProjectRecordPages(useWhiteboardStore.getState().project.pages);
         if (
           current.snapshotJson === snapshotJson
           && current.name === currentProjectTitle
@@ -338,10 +267,8 @@ const App: React.FC = () => {
       lastTitleRef = state.project.title;
       lastPagesRef = state.project.pages;
 
-      if (timer !== null) {
-        window.clearTimeout(timer);
-      }
-      timer = window.setTimeout(() => {
+      platformClearTimeout(timer);
+      timer = platformSetTimeout(() => {
         commit();
         timer = null;
       }, 220);
@@ -349,78 +276,52 @@ const App: React.FC = () => {
 
     return () => {
       unsubscribe();
-      if (timer !== null) {
-        window.clearTimeout(timer);
-      }
+      platformClearTimeout(timer);
     };
   }, [layer, activeProjectId, currentProjectTitle, exportSnapshotJson]);
 
   useEffect(() => {
-    if (!exportMenuOpen) {
+    if (!shellState.exportMenuOpen) {
       return;
     }
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target as HTMLElement | null;
-      if (target?.closest('.export-menu')) {
+      if (target?.closest('.overlay-right')) {
         return;
       }
-      setExportMenuOpen(false);
+      setShellState((prev) => dismissExportMenuCommand(prev));
     };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        setExportMenuOpen(false);
-      }
-    };
-    window.addEventListener('pointerdown', onPointerDown);
-    window.addEventListener('keydown', onKeyDown);
-    return () => {
-      window.removeEventListener('pointerdown', onPointerDown);
-      window.removeEventListener('keydown', onKeyDown);
-    };
-  }, [exportMenuOpen]);
+    return combineWindowEventDisposers(
+      subscribeWindowPointerDown(onPointerDown),
+      subscribeWindowEscape(() => {
+        setShellState((prev) => dismissExportMenuCommand(prev));
+      }),
+    );
+  }, [shellState.exportMenuOpen]);
 
   useEffect(() => {
-    if (!showCreateProjectForm) {
+    if (!shellState.showCreateProjectForm) {
       return;
     }
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        closeCreateProjectDialog();
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => {
-      window.removeEventListener('keydown', onKeyDown);
-    };
-  }, [showCreateProjectForm, creatingProject]);
+    return subscribeWindowEscape(() => {
+      closeCreateProjectDialog();
+    });
+  }, [shellState.showCreateProjectForm, shellState.createProjectDraft.creating]);
 
   useEffect(() => {
-    if (!pageManagerProjectId) {
+    const nextProjectId = resolvePageManagerProjectId(shellState.pageManagerProjectId, projects, layer);
+    if (nextProjectId === shellState.pageManagerProjectId) {
       return;
     }
-    if (projects.some((project) => project.id === pageManagerProjectId)) {
+    setShellState((prev) => syncPageManagerProjectCommand(prev, nextProjectId));
+  }, [layer, projects, shellState.pageManagerProjectId]);
+
+  useEffect(() => {
+    if (!shellState.pageManagerProjectId) {
       return;
     }
-    setPageManagerProjectId(null);
-  }, [projects, pageManagerProjectId]);
-
-  useEffect(() => {
-    if (layer !== 'project' && pageManagerProjectId) {
-      setPageManagerProjectId(null);
-    }
-  }, [layer, pageManagerProjectId]);
-
-  useEffect(() => {
-    setPageManagerSelectedPageIds([]);
-  }, [pageManagerProjectId]);
-
-  useEffect(() => {
-    if (!pageManagerProjectId) {
-      return;
-    }
-    const pageIdSet = new Set(pageManagerPages.map((page) => page.id));
-    setPageManagerSelectedPageIds((prev) => prev.filter((id) => pageIdSet.has(id)));
-  }, [pageManagerProjectId, pageManagerPages]);
+    setShellState((prev) => syncPageManagerSelectionCommand(prev, pageManagerPages));
+  }, [pageManagerPages, shellState.pageManagerProjectId]);
 
   const openProject = (project: ProjectRecord) => {
     const result = importSnapshotJson(project.snapshotJson);
@@ -438,26 +339,28 @@ const App: React.FC = () => {
   };
 
   const createProject = async () => {
-    const name = newProjectName.trim();
+    const name = shellState.createProjectDraft.name.trim();
     if (!name) {
       return;
     }
-    const sourceFile = createProjectMode === 'file' ? newProjectFile : null;
-    if (createProjectMode === 'file' && !sourceFile) {
+    const sourceFile = shellState.createProjectDraft.mode === 'file'
+      ? shellState.createProjectDraft.file
+      : null;
+    if (shellState.createProjectDraft.mode === 'file' && !sourceFile) {
       return;
     }
 
-    setCreatingProject(true);
+    setShellState((prev) => setCreateProjectPendingCommand(prev, true));
     try {
       resetProject();
       setProjectTitle(name);
 
-      let pages = normalizeRecordPages(useWhiteboardStore.getState().project.pages);
+      let pages = normalizeProjectRecordPages(useWhiteboardStore.getState().project.pages);
       if (sourceFile) {
         const { importCoursewareFile, toProjectPagesFromImport } = await import('./utils/coursewareImporter');
         const imported = await importCoursewareFile(sourceFile);
         const importedPages = toProjectPagesFromImport(imported, 0);
-        pages = normalizeRecordPages(importedPages.length > 0 ? importedPages : pages);
+        pages = normalizeProjectRecordPages(importedPages.length > 0 ? importedPages : pages);
         setProjectPages(pages, {
           replace: true,
           switchToPageId: pages[0]?.id,
@@ -471,28 +374,23 @@ const App: React.FC = () => {
       }
 
       const now = new Date().toISOString();
-      const project: ProjectRecord = {
+      const project = createProjectRecord({
         id: generateId('proj'),
         name,
-        author: newProjectAuthor.trim() || undefined,
+        author: shellState.createProjectDraft.author.trim() || undefined,
         createdAt: now,
-        updatedAt: now,
         snapshotJson: exportSnapshotJson(),
         projectPages: pages,
-      };
+      });
 
-      setProjects((prev) => [project, ...prev]);
+      setProjects((prev) => upsertProjectRecord(prev, project));
       setActiveProjectId(project.id);
       setLayer('recording');
-      setShowCreateProjectForm(false);
-      setCreateProjectMode('blank');
-      setNewProjectName('');
-      setNewProjectAuthor('');
-      setNewProjectFile(null);
+      setShellState((prev) => finishCreateProjectCommand(prev));
     } catch {
       // ignore invalid create payloads
     } finally {
-      setCreatingProject(false);
+      setShellState((prev) => setCreateProjectPendingCommand(prev, false));
     }
   };
 
@@ -513,15 +411,15 @@ const App: React.FC = () => {
 
     const fallbackName = file.name.replace(/\.ufproj$/i, '').trim() || 'Imported Project';
     const now = new Date().toISOString();
-    const record: ProjectRecord = {
+    const record = createProjectRecord({
       id: decoded.project?.id?.trim() || generateId('proj'),
       name: decoded.project?.name?.trim() || fallbackName,
       author: decoded.project?.author?.trim() || undefined,
       createdAt: decoded.project?.createdAt || now,
       updatedAt: decoded.project?.updatedAt || now,
       snapshotJson: decoded.snapshotJson,
-      projectPages: normalizeRecordPages(decoded.projectPages),
-    };
+      projectPages: decoded.projectPages,
+    });
     const hydratedPages = record.projectPages;
 
     setProjectTitle(record.name);
@@ -529,19 +427,10 @@ const App: React.FC = () => {
       replace: true,
       touchUpdatedAt: false,
     });
-    setProjects((prev) => {
-      const normalizedRecord: ProjectRecord = {
-        ...record,
-        projectPages: hydratedPages,
-      };
-      const index = prev.findIndex((item) => item.id === record.id);
-      if (index < 0) {
-        return [normalizedRecord, ...prev];
-      }
-      const next = [...prev];
-      next[index] = normalizedRecord;
-      return next;
-    });
+    setProjects((prev) => upsertProjectRecord(prev, {
+      ...record,
+      projectPages: hydratedPages,
+    }));
     setActiveProjectId(record.id);
     setLayer('recording');
   };
@@ -558,36 +447,18 @@ const App: React.FC = () => {
     }
 
     const now = new Date().toISOString();
-    const name = currentProjectTitle || activeProject?.name || 'UniFlow Project';
-    const author = activeProject?.author?.trim() || undefined;
-    const base: ProjectRecord = activeProject ?? {
-      id: activeProjectId,
-      name,
-      createdAt: now,
+    const nextRecord = createProjectRecord({
+      id: activeProject?.id ?? activeProjectId,
+      name: currentProjectTitle || activeProject?.name || 'UniFlow Project',
+      author: activeProject?.author?.trim() || undefined,
+      createdAt: activeProject?.createdAt ?? now,
       updatedAt: now,
       snapshotJson,
-      projectPages: normalizeRecordPages(currentProjectPages),
-    };
-
-    const nextRecord: ProjectRecord = {
-      ...base,
-      name,
-      author,
-      updatedAt: now,
-      snapshotJson,
-      projectPages: normalizeRecordPages(currentProjectPages),
-    };
-
-    setProjects((prev) => {
-      const index = prev.findIndex((item) => item.id === nextRecord.id);
-      if (index < 0) {
-        return [nextRecord, ...prev];
-      }
-      const next = [...prev];
-      next[index] = nextRecord;
-      return next;
+      projectPages: currentProjectPages,
     });
-    setExportMenuOpen(false);
+
+    setProjects((prev) => upsertProjectRecord(prev, nextRecord));
+    setShellState((prev) => dismissExportMenuCommand(prev));
     const snapshotJsonForExport = snapshotToJson(snapshot);
     enqueueExportJob('ufproj', {
       fileBaseName: sanitizeFilename(nextRecord.name),
@@ -609,91 +480,48 @@ const App: React.FC = () => {
     }
     const snapshotJson = exportSnapshotJson();
     const now = new Date().toISOString();
-    const pages = normalizeRecordPages(useWhiteboardStore.getState().project.pages);
-    setProjects((prev) => {
-      const index = prev.findIndex((item) => item.id === activeProjectId);
-      if (index < 0) {
-        return prev;
-      }
-      const current = prev[index];
-      const next = [...prev];
-      next[index] = {
-        ...current,
-        name: currentProjectTitle,
-        updatedAt: now,
-        snapshotJson,
-        projectPages: pages,
-      };
-      return next;
-    });
+    const pages = normalizeProjectRecordPages(useWhiteboardStore.getState().project.pages);
+    setProjects((prev) => updateProjectRecordInLibrary(prev, activeProjectId, (current) => ({
+      ...current,
+      name: currentProjectTitle,
+      updatedAt: now,
+      snapshotJson,
+      projectPages: pages,
+    })));
   };
 
   const renameProjectRecord = (projectId: string, nextNameRaw: string) => {
-    const current = projects.find((project) => project.id === projectId);
-    if (!current) {
-      return;
-    }
-    const nextName = nextNameRaw.trim();
-    if (!nextName || nextName === current.name) {
-      return;
-    }
-    setProjects((prev) => prev.map((project) => (
-      project.id === projectId
-        ? { ...project, name: nextName, updatedAt: new Date().toISOString() }
-        : project
-    )));
+    setProjects((prev) => renameProjectLibraryRecord(prev, projectId, nextNameRaw));
     if (activeProjectId === projectId) {
-      setProjectTitle(nextName);
+      const nextName = nextNameRaw.trim();
+      if (nextName) {
+        setProjectTitle(nextName);
+      }
     }
   };
 
   const beginProjectTitleEdit = (project: ProjectRecord) => {
-    setEditingProjectId(project.id);
-    setEditingProjectName(project.name);
+    setShellState((prev) => beginProjectRenameCommand(prev, project.id, project.name));
   };
 
   const commitProjectTitleEdit = () => {
-    if (!editingProjectId) {
+    if (!shellState.editingProjectId) {
       return;
     }
-    renameProjectRecord(editingProjectId, editingProjectName);
-    setEditingProjectId(null);
-    setEditingProjectName('');
+    renameProjectRecord(shellState.editingProjectId, shellState.editingProjectName);
+    setShellState((prev) => cancelProjectRenameCommand(prev));
   };
 
   const duplicateProjectRecord = (projectId: string) => {
-    const current = projects.find((project) => project.id === projectId);
-    if (!current) {
-      return;
-    }
-    const now = new Date().toISOString();
-    const duplicated: ProjectRecord = {
-      ...current,
-      id: generateId('proj'),
-      name: `${current.name} Copy`,
-      createdAt: now,
-      updatedAt: now,
-      projectPages: normalizeRecordPages(current.projectPages ?? []),
-    };
-    setProjects((prev) => [duplicated, ...prev]);
+    setProjects((prev) => duplicateProjectLibraryRecord(prev, projectId, generateId('proj')));
   };
 
   const deleteProjectRecord = (projectId: string) => {
-    if (projects.length <= 1) {
-      return;
-    }
-    const nextProjects = projects.filter((project) => project.id !== projectId);
-    setProjects(nextProjects);
-    if (activeProjectId === projectId) {
-      const nextActive = nextProjects[0] ?? null;
-      if (nextActive) {
-        setActiveProjectId(nextActive.id);
-      } else {
-        setActiveProjectId(null);
-      }
-    }
-    if (pageManagerProjectId === projectId) {
-      setPageManagerProjectId(null);
+    const nextLibrary = deleteProjectLibraryRecord(projects, activeProjectId, projectId);
+    setProjects(nextLibrary.projects);
+    setActiveProjectId(nextLibrary.activeProjectId);
+    if (shellState.pageManagerProjectId === projectId) {
+      setShellState((prev) => closeProjectPageManagerCommand(prev));
     }
   };
 
@@ -701,119 +529,45 @@ const App: React.FC = () => {
     projectId: string,
     updater: (pages: ProjectPage[]) => ProjectPage[],
   ) => {
-    setProjects((prev) => prev.map((project) => {
-      if (project.id !== projectId) {
-        return project;
-      }
-      const nextPages = normalizeRecordPages(updater(normalizeRecordPages(project.projectPages ?? [])));
-      return {
-        ...project,
-        projectPages: nextPages,
-        updatedAt: new Date().toISOString(),
-      };
-    }));
+    setProjects((prev) => updateProjectPagesInLibrary(prev, projectId, updater));
   };
 
   const addBlankPageToProject = (projectId: string) => {
-    updateProjectPagesRecord(projectId, (pages) => ([
-      ...pages,
-      {
-        id: generateId('page'),
-        name: `Page ${pages.length + 1}`,
-        assetType: 'blank',
-        order: pages.length,
-      },
-    ]));
+    updateProjectPagesRecord(projectId, (pages) => addBlankProjectPage(pages, generateId('page')));
   };
 
   const moveProjectPageInManager = (projectId: string, pageId: string, direction: -1 | 1) => {
-    updateProjectPagesRecord(projectId, (pages) => {
-      const sorted = [...pages].sort((a, b) => a.order - b.order);
-      const index = sorted.findIndex((page) => page.id === pageId);
-      if (index < 0) {
-        return pages;
-      }
-      const target = index + direction;
-      if (target < 0 || target >= sorted.length) {
-        return pages;
-      }
-      const [page] = sorted.splice(index, 1);
-      sorted.splice(target, 0, page);
-      return sorted;
-    });
+    updateProjectPagesRecord(projectId, (pages) => moveProjectPage(pages, pageId, direction));
   };
 
   const duplicateProjectPageInManager = (projectId: string, pageId: string) => {
-    updateProjectPagesRecord(projectId, (pages) => {
-      const sorted = [...pages].sort((a, b) => a.order - b.order);
-      const index = sorted.findIndex((page) => page.id === pageId);
-      if (index < 0) {
-        return pages;
-      }
-      const source = sorted[index];
-      const duplicate: ProjectPage = {
-        ...source,
-        id: generateId('page'),
-        order: index + 1,
-      };
-      sorted.splice(index + 1, 0, duplicate);
-      return sorted;
-    });
-  };
-
-  const deleteProjectPageInManager = (projectId: string, pageId: string) => {
-    const target = projects.find((project) => project.id === projectId);
-    if (!target) {
-      return;
-    }
-    if ((target.projectPages?.length ?? 0) <= 1) {
-      return;
-    }
-    updateProjectPagesRecord(projectId, (pages) => pages.filter((page) => page.id !== pageId));
-  };
-
-  const togglePageManagerSelection = (pageId: string) => {
-    setPageManagerSelectedPageIds((prev) => (
-      prev.includes(pageId)
-        ? prev.filter((id) => id !== pageId)
-        : [...prev, pageId]
+    updateProjectPagesRecord(projectId, (pages) => (
+      duplicateProjectPageInLibrary(pages, pageId, generateId('page'))
     ));
   };
 
+  const deleteProjectPageInManager = (projectId: string, pageId: string) => {
+    updateProjectPagesRecord(projectId, (pages) => deleteProjectPageFromLibrary(pages, pageId));
+  };
+
+  const togglePageManagerSelection = (pageId: string) => {
+    setShellState((prev) => toggleProjectPageSelectionCommand(prev, pageId));
+  };
+
   const duplicateSelectedProjectPagesInManager = (projectId: string) => {
-    if (pageManagerSelectedPageIds.length <= 0) {
-      return;
-    }
-    const selectedSet = new Set(pageManagerSelectedPageIds);
-    updateProjectPagesRecord(projectId, (pages) => {
-      const sorted = [...pages].sort((a, b) => a.order - b.order);
-      const next: ProjectPage[] = [];
-      for (const page of sorted) {
-        next.push(page);
-        if (selectedSet.has(page.id)) {
-          next.push({
-            ...page,
-            id: generateId('page'),
-          });
-        }
-      }
-      return next;
-    });
+    updateProjectPagesRecord(projectId, (pages) => (
+      duplicateSelectedProjectPages(pages, shellState.pageManagerSelectedPageIds, () => generateId('page'))
+    ));
   };
 
   const deleteSelectedProjectPagesInManager = (projectId: string) => {
-    if (pageManagerSelectedPageIds.length <= 0) {
+    if (shellState.pageManagerSelectedPageIds.length <= 0) {
       return;
     }
-    const selectedSet = new Set(pageManagerSelectedPageIds);
-    const target = projects.find((project) => project.id === projectId);
-    const total = target?.projectPages?.length ?? 0;
-    const nextCount = total - pageManagerSelectedPageIds.length;
-    if (nextCount <= 0) {
-      return;
-    }
-    updateProjectPagesRecord(projectId, (pages) => pages.filter((page) => !selectedSet.has(page.id)));
-    setPageManagerSelectedPageIds([]);
+    updateProjectPagesRecord(projectId, (pages) => (
+      deleteSelectedProjectPages(pages, shellState.pageManagerSelectedPageIds)
+    ));
+    setShellState((prev) => clearProjectPageSelectionCommand(prev));
   };
 
   const importCourseware = async (file: File) => {
@@ -824,26 +578,22 @@ const App: React.FC = () => {
     try {
       const { importCoursewareFile, toProjectPagesFromImport } = await import('./utils/coursewareImporter');
       const imported = await importCoursewareFile(file);
-      const currentPages = normalizeRecordPages(useWhiteboardStore.getState().project.pages);
+      const currentPages = normalizeProjectRecordPages(useWhiteboardStore.getState().project.pages);
       const appended = toProjectPagesFromImport(imported, currentPages.length);
-      const nextPages = normalizeRecordPages([...currentPages, ...appended]);
+      const nextPages = normalizeProjectRecordPages([...currentPages, ...appended]);
       setProjectPages(nextPages, {
         replace: true,
         switchToPageId: appended[0]?.id,
       });
       const snapshotJson = exportSnapshotJson();
       const now = new Date().toISOString();
-      setProjects((prev) => prev.map((project) => (
-        project.id === activeProjectId
-          ? {
-            ...project,
-            name: useWhiteboardStore.getState().project.title,
-            snapshotJson,
-            projectPages: nextPages,
-            updatedAt: now,
-          }
-          : project
-      )));
+      setProjects((prev) => updateProjectRecordInLibrary(prev, activeProjectId, (project) => ({
+        ...project,
+        name: useWhiteboardStore.getState().project.title,
+        snapshotJson,
+        projectPages: nextPages,
+        updatedAt: now,
+      })));
     } catch {
       // ignore invalid courseware payloads
     } finally {
@@ -870,26 +620,15 @@ const App: React.FC = () => {
       accept: COURSEWARE_ACCEPT,
       multiple: false,
     });
-    setNewProjectFile(file ?? null);
+    setShellState((prev) => setCreateProjectFileCommand(prev, file ?? null));
   };
 
   const openCreateProjectDialog = (mode: CreateProjectMode) => {
-    setCreateProjectMode(mode);
-    setShowCreateProjectForm(true);
-    setNewProjectName('');
-    setNewProjectAuthor('');
-    setNewProjectFile(null);
+    setShellState((prev) => openCreateProjectDialogCommand(prev, mode));
   };
 
   const closeCreateProjectDialog = () => {
-    if (creatingProject) {
-      return;
-    }
-    setShowCreateProjectForm(false);
-    setCreateProjectMode('blank');
-    setNewProjectName('');
-    setNewProjectAuthor('');
-    setNewProjectFile(null);
+    setShellState((prev) => closeCreateProjectDialogCommand(prev));
   };
 
   const importCoursewareFromDialog = async () => {
@@ -907,7 +646,7 @@ const App: React.FC = () => {
   };
 
   const exportCurrentProjectMp4 = () => {
-    setExportMenuOpen(false);
+    setShellState((prev) => dismissExportMenuCommand(prev));
     const store = useWhiteboardStore.getState();
     const timelineStats = getExportTimelineStats(store.events, store.audioSegments);
     enqueueExportJob('mp4', {
@@ -925,7 +664,7 @@ const App: React.FC = () => {
   };
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${layer === 'recording' ? 'recording-shell' : ''} ${nativeMacDesktop ? 'native-macos' : ''}`}>
       {layer === 'project' ? (
         <section className="panel project-layer">
           <div className="project-header">
@@ -974,11 +713,11 @@ const App: React.FC = () => {
                 <div className="project-card-actions">
                   <button
                     type="button"
-                    className={`icon-btn card-action ${pageManagerProjectId === project.id ? 'selected' : ''}`}
+                    className={`icon-btn card-action ${shellState.pageManagerProjectId === project.id ? 'selected' : ''}`}
                     title="Manage Pages"
                     onClick={(event) => {
                       event.stopPropagation();
-                      setPageManagerProjectId((value) => (value === project.id ? null : project.id));
+                      setShellState((prev) => toggleProjectPageManagerCommand(prev, project.id));
                     }}
                   >
                     <IoLayersOutline size={14} />
@@ -1008,19 +747,20 @@ const App: React.FC = () => {
                   </button>
                 </div>
                 <div className="project-card-title" onClick={() => beginProjectTitleEdit(project)}>
-                  {editingProjectId === project.id ? (
+                  {shellState.editingProjectId === project.id ? (
                     <input
                       autoFocus
                       className="project-title-input"
-                      value={editingProjectName}
-                      onChange={(event) => setEditingProjectName(event.target.value)}
+                      value={shellState.editingProjectName}
+                      onChange={(event) => {
+                        setShellState((prev) => updateProjectRenameDraftCommand(prev, event.target.value));
+                      }}
                       onBlur={commitProjectTitleEdit}
                       onKeyDown={(event) => {
                         if (event.key === 'Enter') {
                           commitProjectTitleEdit();
                         } else if (event.key === 'Escape') {
-                          setEditingProjectId(null);
-                          setEditingProjectName('');
+                          setShellState((prev) => cancelProjectRenameCommand(prev));
                         }
                       }}
                     />
@@ -1054,7 +794,7 @@ const App: React.FC = () => {
                     type="button"
                     className="icon-btn"
                     onClick={() => {
-                      setPageManagerSelectedPageIds(pageManagerPages.map((page) => page.id));
+                      setShellState((prev) => selectAllProjectPagesCommand(prev, pageManagerPages));
                     }}
                   >
                     <IoCheckmarkCircleOutline size={14} />
@@ -1063,7 +803,9 @@ const App: React.FC = () => {
                   <button
                     type="button"
                     className="icon-btn"
-                    onClick={() => setPageManagerSelectedPageIds([])}
+                    onClick={() => {
+                      setShellState((prev) => clearProjectPageSelectionCommand(prev));
+                    }}
                   >
                     <IoRemoveCircleOutline size={14} />
                     清空
@@ -1071,7 +813,7 @@ const App: React.FC = () => {
                   <button
                     type="button"
                     className="icon-btn"
-                    disabled={pageManagerSelectedPageIds.length <= 0}
+                    disabled={shellState.pageManagerSelectedPageIds.length <= 0}
                     onClick={() => duplicateSelectedProjectPagesInManager(pageManagerProject.id)}
                   >
                     <IoCopyOutline size={14} />
@@ -1097,7 +839,9 @@ const App: React.FC = () => {
                   <button
                     type="button"
                     className="icon-btn card-action"
-                    onClick={() => setPageManagerProjectId(null)}
+                    onClick={() => {
+                      setShellState((prev) => closeProjectPageManagerCommand(prev));
+                    }}
                   >
                     <IoCloseOutline size={14} />
                   </button>
@@ -1107,7 +851,7 @@ const App: React.FC = () => {
                 {pageManagerPages.map((page, index, arr) => (
                   <div
                     key={page.id}
-                    className={`project-page-item ${pageManagerSelectedPageIds.includes(page.id) ? 'selected' : ''}`}
+                    className={`project-page-item ${shellState.pageManagerSelectedPageIds.includes(page.id) ? 'selected' : ''}`}
                     onClick={() => togglePageManagerSelection(page.id)}
                   >
                     <div className="project-page-item-meta">
@@ -1167,83 +911,84 @@ const App: React.FC = () => {
         </section>
       ) : (
         <section className="recording-layer">
-          <RecordingOverlay
-            recordingStatus={recordingStatus}
-            coursewareBusy={coursewareBusy}
-            currentProjectPageCount={currentProjectPages.length}
-            runningExportCount={runningExportCount}
-            exportMenuOpen={exportMenuOpen}
-            exportMenuRef={exportMenuRef}
-            onBack={() => {
-              if (recordingStatus !== 'idle') {
-                return;
-              }
-              saveActiveProjectNow();
-              setLayer('project');
-            }}
-            onImportCourseware={() => {
-              void importCoursewareFromDialog();
-            }}
-            onDuplicatePage={() => {
-              duplicateProjectPage(useWhiteboardStore.getState().state.currentPageId);
-            }}
-            onDeletePage={() => {
-              deleteProjectPage(useWhiteboardStore.getState().state.currentPageId);
-            }}
-            onToggleExportMenu={() => setExportMenuOpen((value) => !value)}
-            onExportMp4={() => {
-              setExportMenuOpen(false);
-              void exportCurrentProjectMp4();
-            }}
-            onExportUfproj={() => {
-              setExportMenuOpen(false);
-              void exportCurrentProject();
-            }}
-          />
+          <div className="recording-stage">
+            {nativeMacDesktop ? <div className="native-title-drag-region" aria-hidden="true" /> : null}
+            <RecordingOverlay
+              presentation={recordingOverlayPresentation}
+              projectTitle={currentProjectTitle || activeProject?.name || 'Blackboard'}
+              currentPageLabel={activeProjectPage?.name || 'Blackboard'}
+              exportMenuOpen={shellState.exportMenuOpen}
+              exportMenuRef={exportMenuRef}
+              onBack={() => {
+                if (recordingStatus !== 'idle') {
+                  return;
+                }
+                saveActiveProjectNow();
+                setLayer('project');
+              }}
+              onImportCourseware={() => {
+                void importCoursewareFromDialog();
+              }}
+              onDuplicatePage={() => {
+                duplicateProjectPage(useWhiteboardStore.getState().state.currentPageId);
+              }}
+              onDeletePage={() => {
+                deleteProjectPage(useWhiteboardStore.getState().state.currentPageId);
+              }}
+              onToggleExportMenu={() => {
+                setShellState((prev) => toggleExportMenuCommand(prev));
+              }}
+              onExportMp4={() => {
+                void exportCurrentProjectMp4();
+              }}
+              onExportUfproj={() => {
+                void exportCurrentProject();
+              }}
+            />
 
-          <main className="app-main">
-            <Suspense fallback={<div className="recording-loading">Loading recording workspace…</div>}>
-              <WhiteboardCanvas />
-              <TimelineEditor />
-            </Suspense>
-          </main>
-          {exportJobs.length > 0 ? (
-            <div className="export-task-hud">
-              <div className="export-task-hud-header">
-                <strong>Export Queue</strong>
-                <span>{runningExportCount} running</span>
-                <button
-                  type="button"
-                  className="icon-btn export-task-hud-toggle"
-                  onClick={() => setExportHudCollapsed(!exportHudCollapsed)}
-                >
-                  {exportHudCollapsed ? <IoChevronUpOutline size={14} /> : <IoChevronDownOutline size={14} />}
-                </button>
-                <button
-                  type="button"
-                  className="icon-btn export-task-hud-clear"
-                  disabled={exportJobs.every((task) => task.status === 'running' || task.status === 'queued')}
-                  onClick={clearFinishedExportJobs}
-                >
-                  Clear Done
-                </button>
-              </div>
-              {!exportHudCollapsed ? (
-                <div className="export-task-list">
-                  {exportJobs.map((task) => (
-                    <div key={task.id} className={`export-task-item ${task.status}`}>
-                      <div className="export-task-head">
-                        <strong>{task.kind === 'mp4' ? 'MP4 Export' : 'Project Export'}</strong>
-                        <span>{Math.round(task.progress * 100)}%</span>
-                      </div>
-                      <div className="export-task-message">{task.error ?? task.message}</div>
-                      <div className="export-task-progress">
-                        <div
-                          className="export-task-progress-bar"
-                          style={{ width: `${Math.round(task.progress * 100)}%` }}
-                        />
-                      </div>
-                      <div className="export-task-actions">
+            <main className="app-main recording-workspace">
+              <Suspense fallback={<div className="recording-loading">Loading recording workspace…</div>}>
+                <WhiteboardCanvas />
+                <TimelineEditor />
+              </Suspense>
+            </main>
+            {exportQueuePresentation.hasJobs ? (
+              <div className="export-task-hud">
+                <div className="export-task-hud-header">
+                  <strong>Export Queue</strong>
+                  <span>{exportQueuePresentation.runningCount} running</span>
+                  <button
+                    type="button"
+                    className="icon-btn export-task-hud-toggle"
+                    onClick={() => setExportHudCollapsed(!exportHudCollapsed)}
+                  >
+                    {exportHudCollapsed ? <IoChevronUpOutline size={14} /> : <IoChevronDownOutline size={14} />}
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-btn export-task-hud-clear"
+                    disabled={!exportQueuePresentation.canClearFinished}
+                    onClick={clearFinishedExportJobs}
+                  >
+                    Clear Done
+                  </button>
+                </div>
+                {!exportHudCollapsed ? (
+                  <div className="export-task-list">
+                    {exportJobs.map((task) => (
+                      <div key={task.id} className={`export-task-item ${task.status}`}>
+                        <div className="export-task-head">
+                          <strong>{task.kind === 'mp4' ? 'MP4 Export' : 'Project Export'}</strong>
+                          <span>{Math.round(task.progress * 100)}%</span>
+                        </div>
+                        <div className="export-task-message">{task.error ?? task.message}</div>
+                        <div className="export-task-progress">
+                          <div
+                            className="export-task-progress-bar"
+                            style={{ width: `${Math.round(task.progress * 100)}%` }}
+                          />
+                        </div>
+                        <div className="export-task-actions">
                         {(task.status === 'running' || task.status === 'queued') ? (
                           <button
                             type="button"
@@ -1273,15 +1018,16 @@ const App: React.FC = () => {
                           <IoCloseOutline size={14} />
                         </button>
                       </div>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-            </div>
-          ) : null}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
         </section>
       )}
-      {showCreateProjectForm ? (
+      {shellState.showCreateProjectForm ? (
         <div className="confirm-backdrop" onClick={() => closeCreateProjectDialog()}>
           <div
             className="panel create-project-dialog"
@@ -1294,7 +1040,7 @@ const App: React.FC = () => {
               <button
                 type="button"
                 className="icon-btn card-action"
-                disabled={creatingProject}
+                disabled={shellState.createProjectDraft.creating}
                 onClick={() => closeCreateProjectDialog()}
               >
                 <IoCloseOutline size={14} />
@@ -1303,18 +1049,22 @@ const App: React.FC = () => {
             <div className="create-project-mode-switch">
               <button
                 type="button"
-                className={`icon-btn ${createProjectMode === 'blank' ? 'selected' : ''}`}
-                disabled={creatingProject}
-                onClick={() => setCreateProjectMode('blank')}
+                className={`icon-btn ${shellState.createProjectDraft.mode === 'blank' ? 'selected' : ''}`}
+                disabled={shellState.createProjectDraft.creating}
+                onClick={() => {
+                  setShellState((prev) => setCreateProjectModeCommand(prev, 'blank'));
+                }}
               >
                 <IoAddCircleOutline size={14} />
                 空白项目
               </button>
               <button
                 type="button"
-                className={`icon-btn ${createProjectMode === 'file' ? 'selected' : ''}`}
-                disabled={creatingProject}
-                onClick={() => setCreateProjectMode('file')}
+                className={`icon-btn ${shellState.createProjectDraft.mode === 'file' ? 'selected' : ''}`}
+                disabled={shellState.createProjectDraft.creating}
+                onClick={() => {
+                  setShellState((prev) => setCreateProjectModeCommand(prev, 'file'));
+                }}
               >
                 <IoDocumentAttachOutline size={14} />
                 以文件创建
@@ -1324,7 +1074,7 @@ const App: React.FC = () => {
               className="create-project-form"
               onSubmit={(event) => {
                 event.preventDefault();
-                if (!canSubmitCreateProject) {
+                if (!createProjectDialogPresentation.canSubmit) {
                   return;
                 }
                 void createProject();
@@ -1335,41 +1085,45 @@ const App: React.FC = () => {
                 <input
                   autoFocus
                   type="text"
-                  value={newProjectName}
+                  value={shellState.createProjectDraft.name}
                   placeholder="例如：高数第3讲"
-                  onChange={(event) => setNewProjectName(event.target.value)}
+                  onChange={(event) => {
+                    setShellState((prev) => setCreateProjectNameCommand(prev, event.target.value));
+                  }}
                 />
               </label>
               <label>
                 作者（可选）
                 <input
                   type="text"
-                  value={newProjectAuthor}
+                  value={shellState.createProjectDraft.author}
                   placeholder="例如：张老师"
-                  onChange={(event) => setNewProjectAuthor(event.target.value)}
+                  onChange={(event) => {
+                    setShellState((prev) => setCreateProjectAuthorCommand(prev, event.target.value));
+                  }}
                 />
               </label>
-              {createProjectMode === 'file' ? (
+              {shellState.createProjectDraft.mode === 'file' ? (
                 <div className="create-project-file-row">
                   <button
                     type="button"
                     className="icon-btn"
-                    disabled={creatingProject}
+                    disabled={shellState.createProjectDraft.creating}
                     onClick={() => {
                       void pickCreateProjectCourseware();
                     }}
                   >
                     <IoDocumentAttachOutline size={15} />
-                    {newProjectFile ? '更换课件' : '选择课件'}
+                    {createProjectDialogPresentation.fileButtonLabel}
                   </button>
                   <span className="mono create-project-file-name">
-                    {newProjectFile ? newProjectFile.name : '未选择文件'}
+                    {createProjectDialogPresentation.fileNameLabel}
                   </span>
                 </div>
               ) : (
                 <div className="create-project-file-row hint">
                   <span className="mono create-project-file-name">
-                    将创建一个不带课件的空白项目
+                    {createProjectDialogPresentation.fileNameLabel}
                   </span>
                 </div>
               )}
@@ -1377,7 +1131,7 @@ const App: React.FC = () => {
                 <button
                   type="button"
                   className="icon-btn"
-                  disabled={creatingProject}
+                  disabled={shellState.createProjectDraft.creating}
                   onClick={() => closeCreateProjectDialog()}
                 >
                   取消
@@ -1385,10 +1139,10 @@ const App: React.FC = () => {
                 <button
                   type="submit"
                   className="icon-btn"
-                  disabled={!canSubmitCreateProject}
+                  disabled={!createProjectDialogPresentation.canSubmit}
                 >
                   <IoAddCircleOutline size={15} />
-                  {creatingProject ? '创建中…' : '确认创建'}
+                  {createProjectDialogPresentation.confirmLabel}
                 </button>
               </div>
             </form>

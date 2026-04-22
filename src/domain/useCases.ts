@@ -21,6 +21,8 @@ export type StrokeStyle = {
 export type StrokeCreateInput = {
   points: Point[];
   pointTimes?: number[];
+  pointPressures?: number[];
+  kind?: 'pen' | 'highlight';
   style: StrokeStyle;
   startTime?: number;
 };
@@ -30,6 +32,7 @@ export type RectInput = {
   y: number;
   width: number;
   height: number;
+  rotation?: number;
   style?: Record<string, unknown>;
 };
 
@@ -66,7 +69,14 @@ export const createWhiteboardUseCases = (deps: WhiteboardUseCaseDeps) => {
   };
 
   const createStroke = (input: StrokeCreateInput): string | null => {
-    const { points, pointTimes, style, startTime } = input;
+    const {
+      points,
+      pointTimes,
+      pointPressures,
+      kind,
+      style,
+      startTime,
+    } = input;
     if (points.length === 0) {
       return null;
     }
@@ -78,6 +88,8 @@ export const createWhiteboardUseCases = (deps: WhiteboardUseCaseDeps) => {
         id: strokeId,
         points,
         pointTimes,
+        pointPressures,
+        kind,
         color: style.color,
         width: style.width,
       },
@@ -115,6 +127,7 @@ export const createWhiteboardUseCases = (deps: WhiteboardUseCaseDeps) => {
       y: rect.y,
       width: rect.width,
       height: rect.height,
+      rotation: rect.rotation,
       style: rect.style,
     };
 
@@ -134,6 +147,22 @@ export const createWhiteboardUseCases = (deps: WhiteboardUseCaseDeps) => {
   ) => {
     const payload: ObjectUpdatePayload = {
       transform,
+    };
+
+    dispatchAt(TimelineEventType.OBJECT_UPDATE, {
+      targetId: objectId,
+      payload,
+      time,
+    });
+  };
+
+  const updateObjectStyle = (
+    objectId: string,
+    style: Record<string, unknown>,
+    time?: number,
+  ) => {
+    const payload: ObjectUpdatePayload = {
+      style,
     };
 
     dispatchAt(TimelineEventType.OBJECT_UPDATE, {
@@ -188,6 +217,7 @@ export const createWhiteboardUseCases = (deps: WhiteboardUseCaseDeps) => {
     eraseStrokes,
     createRect,
     updateObjectTransform,
+    updateObjectStyle,
     deleteObject,
     deleteObjects,
     setViewport,

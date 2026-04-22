@@ -12,7 +12,6 @@ import { getEventEndTime, getTimelineMaxTime } from '../../engine/timelineEngine
 import { useWhiteboardStore } from '../../store/useWhiteboardStore';
 import { TimelineTrack } from './TimelineTrack';
 import { normalizeTimelineTime } from '../../domain/time';
-import { createMockWaveform } from '../../domain/timelineSegments';
 import { generateId } from '../../utils/id';
 import { MasterClock } from '../../application/clock/MasterClock';
 import { recordingTimelineRuntime } from '../../application/clock/recordingTimelineRuntime';
@@ -42,6 +41,16 @@ import {
   platformNowMs,
   requestPlatformFrame,
 } from '../../infrastructure/platform/frameScheduler';
+import {
+  combineWindowEventDisposers,
+  subscribeWindowBlur,
+  subscribeWindowEscape,
+  subscribeWindowKeyDown,
+  subscribeWindowPointerDown,
+  subscribeWindowResize,
+} from '../../infrastructure/platform/windowEvents';
+import { getWindowViewportSize } from '../../infrastructure/platform/windowSession';
+import { createObjectUrl } from '../../infrastructure/platform/domFactory';
 
 const getEditorMaxTime = (events: TimelineEvent[], audioSegments: { endTime: number }[], currentTime: number): number => {
   const eventMax = getTimelineMaxTime(events);
@@ -50,11 +59,45 @@ const getEditorMaxTime = (events: TimelineEvent[], audioSegments: { endTime: num
 };
 const INSERT_SYNC_STEP_MS = 60;
 const TIMELINE_FPS = 60;
+const RECORDING_CURSOR_COMMIT_INTERVAL_MS = 96;
+const RECORDING_STATE_SYNC_INTERVAL_MS = 256;
+const LIVE_WAVE_SAMPLE_INTERVAL_MS = 24;
+const LIVE_WAVE_UI_INTERVAL_MS = 140;
+const LIVE_WAVEFORM_HARD_LIMIT_POINTS = 120_000;
+const LIVE_WAVEFORM_UI_MAX_POINTS = 420;
 
 type ContextMenuState = {
   clientX: number;
   clientY: number;
   time: number;
+};
+
+type RecordingChainDiagnostics = {
+  startedAtMs: number;
+  stoppedAtMs: number;
+  blobSizeBytes: number;
+  decodedWavePoints: number;
+  decodedDurationMs: number;
+  insertedWavePoints: number;
+  insertedStartMs: number;
+  insertedEndMs: number;
+  fallbackUsed: boolean;
+  sourceUrlReady: boolean;
+  lastError: string;
+};
+
+const INITIAL_RECORDING_CHAIN_DIAGNOSTICS: RecordingChainDiagnostics = {
+  startedAtMs: 0,
+  stoppedAtMs: 0,
+  blobSizeBytes: 0,
+  decodedWavePoints: 0,
+  decodedDurationMs: 0,
+  insertedWavePoints: 0,
+  insertedStartMs: 0,
+  insertedEndMs: 0,
+  fallbackUsed: false,
+  sourceUrlReady: false,
+  lastError: '',
 };
 
 const formatDurationClock = (timeMs: number): string => {
@@ -70,6 +113,161 @@ const formatDurationClock = (timeMs: number): string => {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}:${String(frame).padStart(2, '0')}`;
 };
 
+const compactLiveWaveform = (waveform: WaveformPoint[]): WaveformPoint[] => {
+  if (waveform.length <= LIVE_WAVEFORM_HARD_LIMIT_POINTS) {
+    return waveform;
+  }
+  const stride = Math.max(2, Math.ceil(waveform.length / LIVE_WAVEFORM_HARD_LIMIT_POINTS));
+  const compacted: WaveformPoint[] = [];
+  for (let i = 0; i < waveform.length; i += stride) {
+    compacted.push(waveform[i]);
+  }
+  const tail = waveform[waveform.length - 1];
+  const last = compacted[compacted.length - 1];
+  if (!last || last.t !== tail.t) {
+    compacted.push(tail);
+  }
+  return compacted;
+};
+
+const buildLiveWaveformPreview = (
+  waveform: WaveformPoint[],
+  startTime: number,
+  endTime: number,
+): WaveformPoint[] => {
+  if (endTime <= startTime) {
+    return [];
+  }
+  if (waveform.length === 0) {
+    return [
+      { t: normalizeTimelineTime(startTime), amp: 0 },
+      { t: normalizeTimelineTime(endTime), amp: 0 },
+    ];
+  }
+
+  const source = waveform.length <= LIVE_WAVEFORM_UI_MAX_POINTS
+    ? waveform
+    : (() => {
+      const stride = Math.max(1, Math.ceil(waveform.length / LIVE_WAVEFORM_UI_MAX_POINTS));
+      const preview: WaveformPoint[] = [];
+      for (let i = 0; i < waveform.length; i += stride) {
+        preview.push(waveform[i]);
+      }
+      const tail = waveform[waveform.length - 1];
+      const last = preview[preview.length - 1];
+      if (!last || last.t !== tail.t) {
+        preview.push(tail);
+      }
+      return preview;
+    })();
+
+  const normalized = source.map((point) => ({
+    t: normalizeTimelineTime(point.t),
+    amp: Math.max(0, Math.min(1, point.amp)),
+    minAmp: typeof point.minAmp === 'number' ? Math.max(-1, Math.min(0, point.minAmp)) : undefined,
+    maxAmp: typeof point.maxAmp === 'number' ? Math.min(1, Math.max(0, point.maxAmp)) : undefined,
+  }));
+
+  const first = normalized[0];
+  const last = normalized[normalized.length - 1];
+  const result: WaveformPoint[] = [];
+  if (first.t > startTime) {
+    result.push({
+      t: normalizeTimelineTime(startTime),
+      amp: first.amp,
+      minAmp: first.minAmp,
+      maxAmp: first.maxAmp,
+    });
+  }
+  result.push(...normalized);
+  if (last.t < endTime) {
+    result.push({
+      t: normalizeTimelineTime(endTime),
+      amp: last.amp,
+      minAmp: last.minAmp,
+      maxAmp: last.maxAmp,
+    });
+  }
+  return result;
+};
+
+const createFallbackLiveWaveform = (
+  startTime: number,
+  endTime: number,
+): WaveformPoint[] => {
+  if (endTime <= startTime) {
+    return [];
+  }
+  return [
+    { t: normalizeTimelineTime(startTime), amp: 0 },
+    { t: normalizeTimelineTime(endTime), amp: 0 },
+  ];
+};
+
+const normalizeRecordedWaveform = (
+  waveform: WaveformPoint[],
+  startTime: number,
+  endTime: number,
+): WaveformPoint[] => {
+  const start = normalizeTimelineTime(startTime);
+  const end = normalizeTimelineTime(endTime);
+  if (end <= start || waveform.length === 0) {
+    return [];
+  }
+
+  const sanitized = waveform
+    .filter((point) => Number.isFinite(point.t) && Number.isFinite(point.amp))
+    .map((point) => ({
+      t: normalizeTimelineTime(Math.max(start, Math.min(end, point.t))),
+      amp: Math.max(0, Math.min(1, point.amp)),
+      minAmp:
+        typeof point.minAmp === 'number'
+          ? Math.max(-1, Math.min(0, point.minAmp))
+          : undefined,
+      maxAmp:
+        typeof point.maxAmp === 'number'
+          ? Math.max(0, Math.min(1, point.maxAmp))
+          : undefined,
+    }))
+    .sort((a, b) => a.t - b.t);
+
+  if (sanitized.length === 0) {
+    return [];
+  }
+
+  const deduped: WaveformPoint[] = [];
+  for (const point of sanitized) {
+    const prev = deduped[deduped.length - 1];
+    if (prev && prev.t === point.t) {
+      deduped[deduped.length - 1] = point;
+    } else {
+      deduped.push(point);
+    }
+  }
+
+  const withBounds: WaveformPoint[] = [];
+  if (deduped[0].t > start) {
+    withBounds.push({
+      t: start,
+      amp: deduped[0].amp,
+      minAmp: deduped[0].minAmp,
+      maxAmp: deduped[0].maxAmp,
+    });
+  }
+  withBounds.push(...deduped);
+  const tail = withBounds[withBounds.length - 1];
+  if (tail.t < end) {
+    withBounds.push({
+      t: end,
+      amp: tail.amp,
+      minAmp: tail.minAmp,
+      maxAmp: tail.maxAmp,
+    });
+  }
+
+  return withBounds.length >= 2 ? withBounds : [];
+};
+
 export const TimelineEditor: React.FC = () => {
   const events = useWhiteboardStore((s) => s.events);
   const timelineSegments = useWhiteboardStore((s) => s.timelineSegments);
@@ -81,6 +279,7 @@ export const TimelineEditor: React.FC = () => {
   const runningExportJobId = useExportJobStore((s) => s.runningJobId);
 
   const seek = useWhiteboardStore((s) => s.seek);
+  const setRuntimeCurrentTime = useWhiteboardStore((s) => s.setRuntimeCurrentTime);
   const setSelectedEvent = useWhiteboardStore((s) => s.setSelectedEvent);
   const setSelectedSegment = useWhiteboardStore((s) => s.setSelectedSegment);
   const deleteRange = useWhiteboardStore((s) => s.deleteRange);
@@ -109,6 +308,11 @@ export const TimelineEditor: React.FC = () => {
   const liveLastSampleRef = useRef(0);
   const liveLastUiRef = useRef(0);
   const liveRecordingIdRef = useRef<string>('aud-live');
+  const recordingWallClockStartRef = useRef<number | null>(null);
+  const recordingLastCursorCommitRef = useRef(0);
+  const recordingLastStateSyncRef = useRef(0);
+  const recordingLastSyncedEventCountRef = useRef(0);
+  const recordingLastSyncedAudioCountRef = useRef(0);
 
   const [playing, setPlaying] = useState(false);
   const [rangeStart, setRangeStart] = useState(0);
@@ -118,6 +322,9 @@ export const TimelineEditor: React.FC = () => {
   const [recordingBusy, setRecordingBusy] = useState(false);
   const [liveRecordingSegment, setLiveRecordingSegment] = useState<AudioSegment | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [recordingChainDiagnostics, setRecordingChainDiagnostics] = useState<RecordingChainDiagnostics>(
+    INITIAL_RECORDING_CHAIN_DIAGNOSTICS,
+  );
 
   const maxTime = useMemo(
     () => getEditorMaxTime(events, audioSegments, currentTime),
@@ -232,8 +439,26 @@ export const TimelineEditor: React.FC = () => {
 
     let rafId = 0;
     const tick = () => {
-      const nextTime = recordingTimelineRuntime.getTimelineNowMs(useWhiteboardStore.getState().currentTime);
-      seek(nextTime);
+      const nextTime = recordingTimelineRuntime.getTimelineNowMs();
+      if ((nextTime - recordingLastCursorCommitRef.current) >= RECORDING_CURSOR_COMMIT_INTERVAL_MS) {
+        setRuntimeCurrentTime(nextTime);
+        recordingLastCursorCommitRef.current = nextTime;
+      }
+      if ((nextTime - recordingLastStateSyncRef.current) >= RECORDING_STATE_SYNC_INTERVAL_MS) {
+        const store = useWhiteboardStore.getState();
+        const timelineMutated = (
+          store.events.length !== recordingLastSyncedEventCountRef.current
+          || store.audioSegments.length !== recordingLastSyncedAudioCountRef.current
+        );
+        if (recordMode === 'insert') {
+          seek(nextTime);
+        }
+        if (timelineMutated) {
+          recordingLastSyncedEventCountRef.current = store.events.length;
+          recordingLastSyncedAudioCountRef.current = store.audioSegments.length;
+        }
+        recordingLastStateSyncRef.current = nextTime;
+      }
 
       if (recordMode === 'insert') {
         const pending = nextTime - (recordingOriginTimelineRef.current + insertedGapDurationRef.current);
@@ -247,7 +472,7 @@ export const TimelineEditor: React.FC = () => {
 
     rafId = requestPlatformFrame(tick);
     return () => cancelPlatformFrame(rafId);
-  }, [recordMode, recordingStatus, seek]);
+  }, [recordMode, recordingStatus, seek, setRuntimeCurrentTime]);
 
   const seekWithReplay = useCallback((time: number) => {
     const t = normalizeTimelineTime(time);
@@ -272,25 +497,29 @@ export const TimelineEditor: React.FC = () => {
     void stopLiveWaveMonitor();
 
     const analyserHandle = createStreamAnalyser(stream, 2048);
-    if (!analyserHandle) {
-      return;
+    if (analyserHandle) {
+      const { context, analyser } = analyserHandle;
+      liveAnalyserHandleRef.current = analyserHandle;
+      recordingTimelineRuntime.attachExternalClock(() => context.currentTime * 1000);
+      liveAnalyserRef.current = analyser;
+    } else {
+      liveAnalyserHandleRef.current = null;
+      liveAnalyserRef.current = null;
     }
-    const { context, analyser } = analyserHandle;
-    liveAnalyserHandleRef.current = analyserHandle;
-    recordingTimelineRuntime.attachExternalClock(() => context.currentTime * 1000);
-    liveAnalyserRef.current = analyser;
     liveWaveformRef.current = [];
     liveLastSampleRef.current = startTime;
     liveLastUiRef.current = startTime;
     liveRecordingIdRef.current = generateId('audlive');
 
-    const buffer = new Uint8Array(analyser.fftSize);
+    const analyser = liveAnalyserRef.current;
+    const buffer = analyser ? new Uint8Array(analyser.fftSize) : null;
     const loop = () => {
       const state = useWhiteboardStore.getState();
-      const timelineTime = state.recordingStatus === 'recording'
-        ? recordingTimelineRuntime.getTimelineNowMs(state.currentTime)
-        : normalizeTimelineTime(state.currentTime);
-      if (state.recordingStatus === 'recording') {
+      if (state.recordingStatus !== 'recording') {
+        return;
+      }
+      const timelineTime = recordingTimelineRuntime.getTimelineNowMs();
+      if (analyser && buffer && (timelineTime - liveLastSampleRef.current >= LIVE_WAVE_SAMPLE_INTERVAL_MS)) {
         analyser.getByteTimeDomainData(buffer);
         let min = 1;
         let max = -1;
@@ -307,34 +536,30 @@ export const TimelineEditor: React.FC = () => {
         const maxAmp = Math.min(1, Math.max(0, max));
         const combined = Math.max(Math.abs(minAmp), Math.abs(maxAmp));
 
-        if (timelineTime - liveLastSampleRef.current >= 8) {
-          liveWaveformRef.current.push({
-            t: timelineTime,
-            amp: combined,
-            minAmp,
-            maxAmp,
-          });
-          if (liveWaveformRef.current.length > 5000) {
-            liveWaveformRef.current = liveWaveformRef.current.slice(-5000);
-          }
-          liveLastSampleRef.current = timelineTime;
+        liveWaveformRef.current.push({
+          t: timelineTime,
+          amp: combined,
+          minAmp,
+          maxAmp,
+        });
+        if (liveWaveformRef.current.length > LIVE_WAVEFORM_HARD_LIMIT_POINTS) {
+          liveWaveformRef.current = compactLiveWaveform(liveWaveformRef.current);
         }
+        liveLastSampleRef.current = timelineTime;
       }
-
-      if (timelineTime - liveLastUiRef.current >= 50) {
+      if (timelineTime - liveLastUiRef.current >= LIVE_WAVE_UI_INTERVAL_MS) {
+        const fallbackWave = createFallbackLiveWaveform(startTime, timelineTime);
         setLiveRecordingSegment({
           id: liveRecordingIdRef.current,
           projectId: DEFAULT_PROJECT_ID,
           startTime,
           endTime: Math.max(startTime, timelineTime),
-          waveform: [...liveWaveformRef.current],
+          waveform: liveWaveformRef.current.length > 0
+            ? buildLiveWaveformPreview(liveWaveformRef.current, startTime, timelineTime)
+            : fallbackWave,
           sourceOffsetMs: 0,
         });
         liveLastUiRef.current = timelineTime;
-      }
-
-      if (state.recordingStatus === 'idle') {
-        return;
       }
       liveMonitorRafRef.current = requestPlatformFrame(loop);
     };
@@ -443,10 +668,20 @@ export const TimelineEditor: React.FC = () => {
       }
 
       recordingOriginTimelineRef.current = startAt;
+      const startedAtMs = platformNowMs();
+      recordingWallClockStartRef.current = startedAtMs;
+      setRecordingChainDiagnostics({
+        ...INITIAL_RECORDING_CHAIN_DIAGNOSTICS,
+        startedAtMs,
+      });
       recordingTimelineRuntime.start(startAt);
       insertedGapDurationRef.current = 0;
+      recordingLastCursorCommitRef.current = startAt;
+      recordingLastStateSyncRef.current = startAt;
 
       const stateAtStart = useWhiteboardStore.getState();
+      recordingLastSyncedEventCountRef.current = stateAtStart.events.length;
+      recordingLastSyncedAudioCountRef.current = stateAtStart.audioSegments.length;
       if (recordMode === 'append') {
         const maxAtStart = getEditorMaxTime(
           stateAtStart.events,
@@ -473,9 +708,15 @@ export const TimelineEditor: React.FC = () => {
       recorder.start(200);
       recorderRef.current = recorder;
       streamRef.current = stream;
+      setLiveRecordingSegment(null);
       setRecordingStatus('recording');
       startLiveWaveMonitor(stream, startAt);
-    } catch {
+    } catch (error) {
+      setRecordingChainDiagnostics((prev) => ({
+        ...prev,
+        stoppedAtMs: platformNowMs(),
+        lastError: error instanceof Error ? error.message : 'start_recording_failed',
+      }));
       // permission denied or unavailable device
     }
   }, [deleteRange, recordMode, recordingBusy, recordingStatus, setRecordingStatus, startLiveWaveMonitor]);
@@ -493,44 +734,94 @@ export const TimelineEditor: React.FC = () => {
 
       const recorder = recorderRef.current;
       let blob: Blob | null = null;
-      const finalTimeFromClock = recordingTimelineRuntime.getTimelineNowMs(useWhiteboardStore.getState().currentTime);
+      const finalTimeFromClock = recordingTimelineRuntime.getTimelineNowMs();
+      let audioInserted = false;
+      let diagnosticsError = '';
+      let diagnosticsBlobSize = 0;
+      let diagnosticsDecodedPoints = 0;
+      let diagnosticsDecodedDurationMs = 0;
+      let diagnosticsInsertedPoints = 0;
+      let diagnosticsInsertedStartMs = 0;
+      let diagnosticsInsertedEndMs = 0;
+      let diagnosticsFallbackUsed = false;
+      let diagnosticsSourceUrlReady = false;
+      const recordedAudioSegmentId = generateId('aud');
 
       if (recorder && recorder.state !== 'inactive') {
         try {
           blob = await recorder.stop();
+          diagnosticsBlobSize = blob?.size ?? 0;
         } catch {
           blob = null;
+          diagnosticsError = 'recorder_stop_failed';
         }
       }
 
       const startTime = recordingOriginTimelineRef.current;
-      let endTime = finalTimeFromClock;
+      const wallElapsed = recordingWallClockStartRef.current === null
+        ? 0
+        : Math.max(0, platformNowMs() - recordingWallClockStartRef.current);
+      const liveWaveTail = liveWaveformRef.current.length > 0
+        ? normalizeTimelineTime(liveWaveformRef.current[liveWaveformRef.current.length - 1].t)
+        : startTime;
+      let endTime = Math.max(
+        normalizeTimelineTime(finalTimeFromClock),
+        normalizeTimelineTime(startTime + wallElapsed),
+        liveWaveTail,
+        normalizeTimelineTime(startTime + 1),
+      );
       seek(endTime);
       applyInsertGapUntil(endTime);
 
+      const persistAudioSegment = (waveform: WaveformPoint[], sourceUrl?: string, sourceDurationMs?: number): boolean => {
+        const normalizedWaveform = normalizeRecordedWaveform(waveform, startTime, endTime);
+        if (normalizedWaveform.length === 0 || endTime <= startTime) {
+          return false;
+        }
+        addAudioSegment({
+          id: recordedAudioSegmentId,
+          projectId: DEFAULT_PROJECT_ID,
+          startTime,
+          endTime,
+          waveform: normalizedWaveform,
+          sourceOffsetMs: 0,
+          sourceDurationMs: sourceDurationMs ?? Math.max(1, endTime - startTime),
+          sourceUrl,
+        });
+        diagnosticsInsertedPoints = normalizedWaveform.length;
+        diagnosticsInsertedStartMs = startTime;
+        diagnosticsInsertedEndMs = endTime;
+        audioInserted = true;
+        return true;
+      };
+
+      const liveWaveform = buildRecordedWaveform(startTime, endTime);
+      persistAudioSegment(liveWaveform);
+
       if (blob && blob.size > 0 && endTime > startTime) {
-        const sourceUrl = URL.createObjectURL(blob);
+        const sourceUrl = createObjectUrl(blob);
+        diagnosticsSourceUrlReady = !!sourceUrl;
         const built = await buildWaveformFromAudioBlob(blob, startTime, endTime);
+        diagnosticsDecodedPoints = built.waveform.length;
+        diagnosticsDecodedDurationMs = built.sourceDurationMs;
         const sourceDurationMs = built.sourceDurationMs > 0
           ? built.sourceDurationMs
           : Math.max(1, endTime - startTime);
         endTime = normalizeTimelineTime(startTime + sourceDurationMs);
         seek(endTime);
         applyInsertGapUntil(endTime);
-        let waveform = built.waveform;
-        if (waveform.length === 0) {
-          waveform = buildRecordedWaveform(startTime, endTime);
+
+        if (built.waveform.length > 0) {
+          persistAudioSegment(built.waveform, sourceUrl ?? undefined, sourceDurationMs);
+        } else {
+          diagnosticsFallbackUsed = true;
+          const refreshedLiveWaveform = buildRecordedWaveform(startTime, endTime);
+          persistAudioSegment(refreshedLiveWaveform, sourceUrl ?? undefined, sourceDurationMs);
         }
-        addAudioSegment({
-          id: generateId('aud'),
-          projectId: DEFAULT_PROJECT_ID,
-          startTime,
-          endTime,
-          waveform: waveform.length > 0 ? waveform : createMockWaveform(startTime, endTime),
-          sourceOffsetMs: 0,
-          sourceDurationMs,
-          sourceUrl,
-        });
+      }
+
+      if (!audioInserted && diagnosticsError.length === 0) {
+        diagnosticsError = 'no_waveform_captured';
       }
 
       await stopLiveWaveMonitor();
@@ -542,11 +833,26 @@ export const TimelineEditor: React.FC = () => {
       streamRef.current = null;
       recorderRef.current = null;
       recordingTimelineRuntime.reset();
+      recordingWallClockStartRef.current = null;
       insertedGapDurationRef.current = 0;
       recordingBaseEventIdsRef.current = [];
       recordingBaseAudioIdsRef.current = [];
       setRecordingStatus('idle');
+      setRecordingChainDiagnostics((prev) => ({
+        ...prev,
+        stoppedAtMs: platformNowMs(),
+        blobSizeBytes: diagnosticsBlobSize,
+        decodedWavePoints: diagnosticsDecodedPoints,
+        decodedDurationMs: diagnosticsDecodedDurationMs,
+        insertedWavePoints: diagnosticsInsertedPoints,
+        insertedStartMs: diagnosticsInsertedStartMs,
+        insertedEndMs: diagnosticsInsertedEndMs,
+        fallbackUsed: diagnosticsFallbackUsed,
+        sourceUrlReady: diagnosticsSourceUrlReady,
+        lastError: diagnosticsError,
+      }));
     } finally {
+      recordingWallClockStartRef.current = null;
       setRecordingBusy(false);
     }
   }, [addAudioSegment, applyInsertGapUntil, recordingBusy, recordingStatus, seek, setRecordingStatus]);
@@ -608,8 +914,7 @@ export const TimelineEditor: React.FC = () => {
       void startPreviewPlayback();
     };
 
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
+    return subscribeWindowKeyDown(onKeyDown);
   }, [recordingBusy, recordingStatus, startPreviewPlayback]);
 
   useEffect(() => {
@@ -624,23 +929,16 @@ export const TimelineEditor: React.FC = () => {
       }
       setContextMenu(null);
     };
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        setContextMenu(null);
-      }
-    };
     const close = () => setContextMenu(null);
 
-    window.addEventListener('pointerdown', closeOnPointerDown);
-    window.addEventListener('keydown', closeOnEscape);
-    window.addEventListener('resize', close);
-    window.addEventListener('blur', close);
-    return () => {
-      window.removeEventListener('pointerdown', closeOnPointerDown);
-      window.removeEventListener('keydown', closeOnEscape);
-      window.removeEventListener('resize', close);
-      window.removeEventListener('blur', close);
-    };
+    return combineWindowEventDisposers(
+      subscribeWindowPointerDown(closeOnPointerDown),
+      subscribeWindowEscape(() => {
+        setContextMenu(null);
+      }),
+      subscribeWindowResize(close),
+      subscribeWindowBlur(close),
+    );
   }, [contextMenu]);
 
   const start = Math.min(rangeStart, rangeEnd);
@@ -685,11 +983,19 @@ export const TimelineEditor: React.FC = () => {
   const timelineClock = `${formatDurationClock(currentTime)} / ${formatDurationClock(trackMaxTime)}`;
   const canDeleteFutureAtContext = !!contextMenu && canEditTimeline && contextMenu.time < trackMaxTime;
   const canCutAtContext = !!contextMenu && canCutAtTime(contextMenu.time);
+  const hideTimelineDock = recordingStatus === 'recording';
+  const compactRecordingTransport = recordingStatus === 'recording';
+  const viewportSize = contextMenu
+    ? getWindowViewportSize({
+      width: contextMenu.clientX,
+      height: contextMenu.clientY,
+    })
+    : { width: 0, height: 0 };
   const contextMenuLeft = contextMenu
-    ? Math.max(8, Math.min(contextMenu.clientX, (typeof window !== 'undefined' ? window.innerWidth : contextMenu.clientX) - 196))
+    ? Math.max(8, Math.min(contextMenu.clientX, viewportSize.width - 196))
     : 0;
   const contextMenuTop = contextMenu
-    ? Math.max(8, Math.min(contextMenu.clientY, (typeof window !== 'undefined' ? window.innerHeight : contextMenu.clientY) - 180))
+    ? Math.max(8, Math.min(contextMenu.clientY, viewportSize.height - 180))
     : 0;
   const handleSelectEvent = useCallback((id: string) => {
     setSelectedEvent(id);
@@ -709,40 +1015,68 @@ export const TimelineEditor: React.FC = () => {
   }, [canEditTimeline]);
 
   return (
-    <section className="timeline-editor">
-      <OperationBar
-        mode={operationMode}
-        isPlaying={playing}
-        isRecordingBusy={recordingBusy}
-        recordMode={recordMode}
-        snapEnabled={snapEnabled}
-        timelineClock={timelineClock}
-        availability={operationAvailability}
-        onToggleRecord={toggleRecording}
-        onTogglePlayback={togglePreviewPlayback}
-        onSetRecordMode={setRecordMode}
-        onCutAtPlayhead={handleCutAtPlayhead}
-        onDeleteFuture={() => deleteFuture(currentTime)}
-        onDeleteAndStitch={() => rippleDeleteRange(start, end)}
-        onToggleSnap={() => setSnapEnabled((value) => !value)}
-      />
-
-      <TimelineTrack
-        events={events}
-        segments={timelineSegments}
-        audioSegments={displayAudioSegments}
-        currentTime={currentTime}
-        maxTime={trackMaxTime}
-        selectedEventId={selectedEventId}
-        selectedSegmentId={selectedSegmentId}
-        canSeek={canSeekTimeline}
-        snapEnabled={snapEnabled}
-        fps={TIMELINE_FPS}
-        onSeek={seekWithReplay}
-        onSelectEvent={handleSelectEvent}
-        onSelectSegment={handleSelectSegment}
-        onOpenContextMenu={handleOpenContextMenu}
-      />
+    <section className={`timeline-editor ${hideTimelineDock ? 'timeline-editor-recording' : ''}`}>
+      {!hideTimelineDock ? (
+        <div className="timeline-dock panel">
+          <OperationBar
+            mode={operationMode}
+            isPlaying={playing}
+            isRecordingBusy={recordingBusy}
+            recordMode={recordMode}
+            snapEnabled={snapEnabled}
+            timelineClock={timelineClock}
+            availability={operationAvailability}
+            hideToolbar={false}
+            compactRecording={false}
+            onToggleRecord={toggleRecording}
+            onTogglePlayback={togglePreviewPlayback}
+            onSetRecordMode={setRecordMode}
+            onCutAtPlayhead={handleCutAtPlayhead}
+            onDeleteFuture={() => deleteFuture(currentTime)}
+            onDeleteAndStitch={() => rippleDeleteRange(start, end)}
+            onToggleSnap={() => setSnapEnabled((value) => !value)}
+          />
+          <div className="timeline-track-shell">
+            <TimelineTrack
+              events={events}
+              segments={timelineSegments}
+              audioSegments={displayAudioSegments}
+              currentTime={currentTime}
+              maxTime={trackMaxTime}
+              selectedEventId={selectedEventId}
+              selectedSegmentId={selectedSegmentId}
+              canSeek={canSeekTimeline}
+              snapEnabled={snapEnabled}
+              fps={TIMELINE_FPS}
+              recordingDiagnostics={recordingChainDiagnostics}
+              onSeek={seekWithReplay}
+              onSelectEvent={handleSelectEvent}
+              onSelectSegment={handleSelectSegment}
+              onOpenContextMenu={handleOpenContextMenu}
+            />
+          </div>
+        </div>
+      ) : null}
+      {hideTimelineDock ? (
+        <OperationBar
+          mode={operationMode}
+          isPlaying={playing}
+          isRecordingBusy={recordingBusy}
+          recordMode={recordMode}
+          snapEnabled={snapEnabled}
+          timelineClock={timelineClock}
+          availability={operationAvailability}
+          hideToolbar={hideTimelineDock}
+          compactRecording={compactRecordingTransport}
+          onToggleRecord={toggleRecording}
+          onTogglePlayback={togglePreviewPlayback}
+          onSetRecordMode={setRecordMode}
+          onCutAtPlayhead={handleCutAtPlayhead}
+          onDeleteFuture={() => deleteFuture(currentTime)}
+          onDeleteAndStitch={() => rippleDeleteRange(start, end)}
+          onToggleSnap={() => setSnapEnabled((value) => !value)}
+        />
+      ) : null}
       {contextMenu && (
         <div
           className="timeline-context-menu panel"

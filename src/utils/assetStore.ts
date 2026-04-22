@@ -1,3 +1,4 @@
+import { createObjectUrl } from '../infrastructure/platform/domFactory';
 import { generateId } from './id';
 
 const DB_NAME = 'uniflow.assets.db';
@@ -84,7 +85,7 @@ export const loadAssetObjectUrl = async (key: string): Promise<string | null> =>
   if (!blob) {
     return null;
   }
-  return URL.createObjectURL(blob);
+  return createObjectUrl(blob);
 };
 
 const blobToDataUrl = async (blob: Blob): Promise<string> => {
@@ -116,4 +117,3 @@ export const importDataUrlAsAsset = async (
   const blob = await dataUrlToBlob(dataUrl);
   return saveAssetBlob(blob, preferredKey);
 };
-

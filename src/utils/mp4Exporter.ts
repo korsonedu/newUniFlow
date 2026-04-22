@@ -11,14 +11,20 @@ import {
   sortEvents,
 } from '../engine/timelineEngine';
 import {
+  getStrokePointPressuresAtTime,
   getStrokePointsAtTime,
   getVisibleObjects,
   getVisibleStrokes,
 } from '../domain/selectors';
+import {
+  createCanvasElement,
+  createImageElement,
+  revokeObjectUrl,
+} from '../infrastructure/platform/domFactory';
 import { loadAssetObjectUrl } from './assetStore';
-import { pointsToSvgPath } from './geometry';
 import { createAudioContext } from '../infrastructure/platform/audioContext';
 import { requestPlatformFrame } from '../infrastructure/platform/frameScheduler';
+import { buildPerfectStrokePath } from '../application/drawing/perfectStroke';
 
 type ExportVideoOptions = {
   projectId: string;
@@ -59,7 +65,11 @@ const clamp = (value: number, min: number, max: number): number => {
 
 const loadImage = async (src: string): Promise<HTMLImageElement> => {
   return new Promise<HTMLImageElement>((resolve, reject) => {
-    const img = new Image();
+    const img = createImageElement();
+    if (!img) {
+      reject(new Error('Image element unavailable'));
+      return;
+    }
     img.onload = () => resolve(img);
     img.onerror = () => reject(new Error(`Failed to load image: ${src}`));
     img.src = src;
@@ -156,7 +166,10 @@ export const exportProjectMp4 = async (options: ExportVideoOptions): Promise<Exp
   const outWidth = Math.max(640, Math.round(baseWidth * scale));
   const outHeight = Math.max(360, Math.round(baseHeight * scale));
 
-  const canvas = document.createElement('canvas');
+  const canvas = createCanvasElement();
+  if (!canvas) {
+    throw new Error('视频导出失败：无法创建渲染画布。');
+  }
   canvas.width = outWidth;
   canvas.height = outHeight;
   const ctx = canvas.getContext('2d', { alpha: false });
@@ -193,7 +206,7 @@ export const exportProjectMp4 = async (options: ExportVideoOptions): Promise<Exp
       }
     } catch {
       if (!page.backgroundUrl) {
-        URL.revokeObjectURL(sourceUrl);
+        revokeObjectUrl(sourceUrl);
       }
     }
     if (orderedPages.length > 0) {
@@ -265,20 +278,24 @@ export const exportProjectMp4 = async (options: ExportVideoOptions): Promise<Exp
     const visibleStrokes = getVisibleStrokes(state, timeMs);
     for (const stroke of visibleStrokes) {
       const points = getStrokePointsAtTime(stroke, timeMs);
+      const pointPressures = getStrokePointPressuresAtTime(stroke, timeMs);
       if (points.length === 0) {
         continue;
       }
-      const path2d = new Path2D();
-      const d = pointsToSvgPath(points.map((point) => ({
+      const d = buildPerfectStrokePath(points.map((point) => ({
         x: (point.x - viewport.x) * xScale,
         y: (point.y - viewport.y) * yScale,
-      })));
-      path2d.addPath(new Path2D(d));
-      ctx.strokeStyle = stroke.color;
-      ctx.lineWidth = Math.max(0.5, stroke.width * ((xScale + yScale) / 2));
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-      ctx.stroke(path2d);
+      })), Math.max(0.5, stroke.width * ((xScale + yScale) / 2)), {
+        complete: true,
+        pressures: pointPressures,
+        variant: stroke.kind ?? 'auto',
+      });
+      if (!d) {
+        continue;
+      }
+      const path2d = new Path2D(d);
+      ctx.fillStyle = stroke.color;
+      ctx.fill(path2d);
     }
 
     const visibleObjects = getVisibleObjects(state, timeMs);
@@ -348,7 +365,7 @@ export const exportProjectMp4 = async (options: ExportVideoOptions): Promise<Exp
   report(1, `Export done (${ext.toUpperCase()})`);
 
   for (const url of revokeUrls) {
-    URL.revokeObjectURL(url);
+    revokeObjectUrl(url);
   }
   try {
     await audioContext.close();

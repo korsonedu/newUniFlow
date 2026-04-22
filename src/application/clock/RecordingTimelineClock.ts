@@ -1,4 +1,5 @@
 import { normalizeTimelineTime } from '../../domain/time';
+import { platformNowMs } from '../../infrastructure/platform/frameScheduler';
 
 type ClockNowFn = () => number;
 
@@ -9,7 +10,7 @@ export class RecordingTimelineClock {
   private externalClockOriginMs: number | null = null;
   private externalNow: ClockNowFn | null = null;
 
-  start(timelineOriginMs: number, wallNowMs = performance.now()): void {
+  start(timelineOriginMs: number, wallNowMs = platformNowMs()): void {
     this.started = true;
     this.timelineOriginMs = normalizeTimelineTime(timelineOriginMs);
     this.wallOriginMs = wallNowMs;
@@ -25,7 +26,7 @@ export class RecordingTimelineClock {
    * Attach a high-precision external clock (e.g. AudioContext.currentTime * 1000).
    * We preserve elapsed continuity at attach time so timeline does not jump.
    */
-  attachExternalClock(now: ClockNowFn, wallNowMs = performance.now()): void {
+  attachExternalClock(now: ClockNowFn, wallNowMs = platformNowMs()): void {
     if (!this.started) {
       return;
     }
@@ -35,7 +36,7 @@ export class RecordingTimelineClock {
     this.externalClockOriginMs = nowMs - elapsedFromWall;
   }
 
-  detachExternalClock(wallNowMs = performance.now()): void {
+  detachExternalClock(wallNowMs = platformNowMs()): void {
     if (!this.started) {
       return;
     }
@@ -45,17 +46,21 @@ export class RecordingTimelineClock {
     this.externalClockOriginMs = null;
   }
 
-  getElapsedMs(wallNowMs = performance.now()): number {
+  getElapsedMs(wallNowMs = platformNowMs()): number {
     if (!this.started) {
       return 0;
     }
+    const wallElapsed = Math.max(0, wallNowMs - this.wallOriginMs);
     if (this.externalNow && this.externalClockOriginMs !== null) {
-      return Math.max(0, this.externalNow() - this.externalClockOriginMs);
+      // Some browsers/devices can keep AudioContext alive but stop advancing currentTime
+      // (suspend race, route change). Falling back to wall clock prevents timeline stall.
+      const externalElapsed = Math.max(0, this.externalNow() - this.externalClockOriginMs);
+      return Math.max(externalElapsed, wallElapsed);
     }
-    return Math.max(0, wallNowMs - this.wallOriginMs);
+    return wallElapsed;
   }
 
-  getTimelineNowMs(wallNowMs = performance.now()): number {
+  getTimelineNowMs(wallNowMs = platformNowMs()): number {
     if (!this.started) {
       return normalizeTimelineTime(this.timelineOriginMs);
     }

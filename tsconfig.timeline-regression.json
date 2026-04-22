@@ -11,6 +11,7 @@
   "include": [
     "src/application/timeline/regressionSuite.ts",
     "src/application/timeline/regressionSuite.cli.ts",
+    "src/application/timeline/stabilityMatrix.cli.ts",
     "src/store/useWhiteboardStore.ts",
     "src/application/timeline/transactions.ts",
     "src/engine/timelineEngine.ts",

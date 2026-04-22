@@ -1,5 +1,11 @@
 import { useWhiteboardStore } from './useWhiteboardStore';
 import { createSnapshot, saveSnapshotToStorage } from './snapshot';
+import { subscribeAppLifecycle } from '../infrastructure/platform/appLifecycle';
+import {
+  platformClearTimeout,
+  platformSetTimeout,
+  PlatformTimerHandle,
+} from '../infrastructure/platform/timer';
 
 let initialized = false;
 
@@ -9,12 +15,23 @@ export const installStorePersistence = (): void => {
   }
   initialized = true;
 
-  let timer: number | null = null;
+  let timer: PlatformTimerHandle | null = null;
+  let latestState = useWhiteboardStore.getState();
   let lastEventsRef = useWhiteboardStore.getState().events;
   let lastAudioRef = useWhiteboardStore.getState().audioSegments;
   let lastRecordingStatus = useWhiteboardStore.getState().recordingStatus;
 
+  const flushSnapshot = () => {
+    const snapshot = createSnapshot(
+      latestState.events,
+      latestState.currentTime,
+      latestState.audioSegments,
+    );
+    saveSnapshotToStorage(snapshot);
+  };
+
   useWhiteboardStore.subscribe((state) => {
+    latestState = state;
     const eventsChanged = state.events !== lastEventsRef;
     const audioChanged = state.audioSegments !== lastAudioRef;
     const statusChanged = state.recordingStatus !== lastRecordingStatus;
@@ -26,14 +43,24 @@ export const installStorePersistence = (): void => {
     lastAudioRef = state.audioSegments;
     lastRecordingStatus = state.recordingStatus;
 
-    if (timer !== null) {
-      window.clearTimeout(timer);
-    }
+    platformClearTimeout(timer);
 
-    timer = window.setTimeout(() => {
-      const snapshot = createSnapshot(state.events, state.currentTime, state.audioSegments);
-      saveSnapshotToStorage(snapshot);
+    timer = platformSetTimeout(() => {
+      flushSnapshot();
       timer = null;
     }, 180);
+  });
+
+  subscribeAppLifecycle((event) => {
+    if (
+      event === 'background'
+      || event === 'blur'
+      || event === 'pagehide'
+      || event === 'beforeunload'
+    ) {
+      platformClearTimeout(timer);
+      timer = null;
+      flushSnapshot();
+    }
   });
 };

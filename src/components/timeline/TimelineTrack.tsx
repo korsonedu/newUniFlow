@@ -7,6 +7,7 @@ import {
 } from '../../domain/types';
 import { normalizeTimelineTime } from '../../domain/time';
 import { getEventEndTime } from '../../engine/timelineEngine';
+import { subscribeWindowResize } from '../../infrastructure/platform/windowEvents';
 
 type TimelineTrackProps = {
   events: TimelineEvent[];
@@ -23,6 +24,19 @@ type TimelineTrackProps = {
   onOpenContextMenu?: (params: { clientX: number; clientY: number; time: number }) => void;
   snapEnabled?: boolean;
   fps?: number;
+  recordingDiagnostics?: {
+    startedAtMs: number;
+    stoppedAtMs: number;
+    blobSizeBytes: number;
+    decodedWavePoints: number;
+    decodedDurationMs: number;
+    insertedWavePoints: number;
+    insertedStartMs: number;
+    insertedEndMs: number;
+    fallbackUsed: boolean;
+    sourceUrlReady: boolean;
+    lastError: string;
+  };
 };
 
 type ActionBlock = {
@@ -54,6 +68,28 @@ type WaveShape = {
   path: string;
 };
 
+type WaveDiagnostics = {
+  audioSegmentCount: number;
+  totalWavePoints: number;
+  renderedWavePaths: number;
+  baselineSegments: number;
+  combinedLaneHeightPx: number;
+  waveLayerHeightPx: number;
+  thumbsLayerHeightPx: number;
+  waveLayerZ: number;
+  thumbsLayerZ: number;
+  waveLayerDisplay: string;
+  waveLayerVisibility: string;
+  waveLayerOpacity: number;
+};
+
+type WaveVisibilityCause =
+  | 'ok'
+  | 'data-missing'
+  | 'layout-too-small'
+  | 'layer-occluded'
+  | 'wave-hidden';
+
 const eventColorMap: Record<TimelineEventType, string> = {
   [TimelineEventType.STROKE_CREATE]: '#0a84ff',
   [TimelineEventType.STROKE_ERASE]: '#ff3b30',
@@ -83,6 +119,58 @@ const STRUCT_SNAP_THRESHOLD_PX = 14;
 const WAVE_SVG_WIDTH = 1000;
 const WAVE_POINT_MIN = 48;
 const WAVE_POINT_MAX = 2400;
+const AUDIO_SEGMENT_MIN_WIDTH_PX = 10;
+const WAVE_DIAGNOSTIC_PANEL_STYLE: React.CSSProperties = {
+  position: 'absolute',
+  top: 12,
+  right: 12,
+  zIndex: 18,
+  display: 'inline-flex',
+  flexWrap: 'wrap',
+  alignItems: 'center',
+  gap: 4,
+  padding: '4px 8px',
+  borderRadius: 10,
+  border: '1px solid rgba(15, 23, 42, 0.18)',
+  background: 'rgba(255, 255, 255, 0.92)',
+  color: '#111827',
+  fontFamily: 'var(--font-mono)',
+  fontSize: 9,
+  lineHeight: 1.2,
+  pointerEvents: 'none',
+};
+const LAYOUT_HEALTH_MIN_HEIGHT_PX = 12;
+
+const parseZIndex = (value: string): number => {
+  if (value === 'auto') {
+    return 0;
+  }
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const classifyWaveVisibilityCause = (diag: WaveDiagnostics): WaveVisibilityCause => {
+  if (diag.audioSegmentCount <= 0) {
+    return 'ok';
+  }
+  if (
+    diag.waveLayerDisplay === 'none'
+    || diag.waveLayerVisibility === 'hidden'
+    || diag.waveLayerOpacity <= 0.001
+  ) {
+    return 'wave-hidden';
+  }
+  if (diag.waveLayerHeightPx < LAYOUT_HEALTH_MIN_HEIGHT_PX) {
+    return 'layout-too-small';
+  }
+  if (diag.waveLayerZ <= diag.thumbsLayerZ) {
+    return 'layer-occluded';
+  }
+  if (diag.totalWavePoints <= 0) {
+    return 'data-missing';
+  }
+  return 'ok';
+};
 
 const ACTION_EVENT_TYPES = new Set<TimelineEventType>([
   TimelineEventType.STROKE_CREATE,
@@ -191,7 +279,17 @@ const buildWavePath = (
   const duration = endTime - startTime;
   const targetPoints = Math.max(2, clamp(Math.round(widthPx * 1.4), WAVE_POINT_MIN, WAVE_POINT_MAX));
 
-  const pointsWithPeaks = points.map((point) => ({
+  const sourcePoints = points.length >= 2
+    ? points
+    : [
+        points[0],
+        {
+          ...points[0],
+          t: endTime,
+        },
+      ];
+
+  const pointsWithPeaks = sourcePoints.map((point) => ({
     t: normalizeTimelineTime(point.t),
     min: typeof point.minAmp === 'number'
       ? clamp(point.minAmp, -1, 0)
@@ -226,13 +324,26 @@ const buildWavePath = (
       return result;
     })();
 
+  let minAcross = 0;
+  let maxAcross = 0;
+  for (const point of sampled) {
+    if (point.min < minAcross) {
+      minAcross = point.min;
+    }
+    if (point.max > maxAcross) {
+      maxAcross = point.max;
+    }
+  }
+
   const top: Array<{ x: number; y: number }> = [];
   const bottom: Array<{ x: number; y: number }> = [];
   for (const point of sampled) {
     const ratio = clamp((point.t - startTime) / duration, 0, 1);
     const x = ratio * WAVE_SVG_WIDTH;
-    top.push({ x, y: 50 - (point.max * 48) });
-    bottom.push({ x, y: 50 - (point.min * 48) });
+    const visualMax = point.max <= 0.02 ? 0.05 : point.max;
+    const visualMin = point.min >= -0.02 ? -0.05 : point.min;
+    top.push({ x, y: 50 - (visualMax * 48) });
+    bottom.push({ x, y: 50 - (visualMin * 48) });
   }
 
   const topPath = top.map((point) => `L ${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(' ');
@@ -260,13 +371,31 @@ export const TimelineTrack: React.FC<TimelineTrackProps> = ({
   onOpenContextMenu,
   snapEnabled = false,
   fps = 60,
+  recordingDiagnostics,
 }) => {
   const safeMaxTime = useMemo(() => Math.max(1200, maxTime, currentTime, 1), [maxTime, currentTime]);
   const [viewportWidth, setViewportWidth] = useState(TIMELINE_MIN_WIDTH_PX);
   const [scrollLeft, setScrollLeft] = useState(0);
   const [dragPreview, setDragPreview] = useState<DragPreview | null>(null);
+  const [waveDiagnostics, setWaveDiagnostics] = useState<WaveDiagnostics>({
+    audioSegmentCount: 0,
+    totalWavePoints: 0,
+    renderedWavePaths: 0,
+    baselineSegments: 0,
+    combinedLaneHeightPx: 0,
+    waveLayerHeightPx: 0,
+    thumbsLayerHeightPx: 0,
+    waveLayerZ: 0,
+    thumbsLayerZ: 0,
+    waveLayerDisplay: '',
+    waveLayerVisibility: '',
+    waveLayerOpacity: 1,
+  });
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const combinedLaneRef = useRef<HTMLDivElement | null>(null);
+  const waveLayerRef = useRef<HTMLDivElement | null>(null);
+  const thumbsLayerRef = useRef<HTMLDivElement | null>(null);
   const draggingPlayheadRef = useRef(false);
 
   const timelineDurationMs = useMemo(
@@ -296,9 +425,9 @@ export const TimelineTrack: React.FC<TimelineTrackProps> = ({
     return normalizeTimelineTime(Math.min(timelineDurationMs, clamped / TIMELINE_PX_PER_MS));
   }, [timelineDurationMs, timelineWidth]);
 
-  const lanePixelStyle = useCallback((start: number, end: number): React.CSSProperties => {
+  const lanePixelStyle = useCallback((start: number, end: number, minWidthPx = 2): React.CSSProperties => {
     const left = timeToPx(start);
-    const width = Math.max(2, timeToPx(end) - left);
+    const width = Math.max(minWidthPx, timeToPx(end) - left);
     return {
       left: `${left}px`,
       width: `${width}px`,
@@ -437,7 +566,7 @@ export const TimelineTrack: React.FC<TimelineTrackProps> = ({
     return audioSegments.map((segment) => {
       const startTime = normalizeTimelineTime(segment.startTime);
       const endTime = normalizeTimelineTime(segment.endTime);
-      const widthPx = Math.max(2, timeToPx(endTime) - timeToPx(startTime));
+      const widthPx = Math.max(AUDIO_SEGMENT_MIN_WIDTH_PX, timeToPx(endTime) - timeToPx(startTime));
       return {
         id: segment.id,
         startTime,
@@ -525,16 +654,77 @@ export const TimelineTrack: React.FC<TimelineTrackProps> = ({
     return waveShapes.map((shape) => (
       <div
         key={shape.id}
-        className="audio-segment audio-overlay"
-        style={lanePixelStyle(shape.startTime, shape.endTime)}
+        className={`audio-segment audio-overlay ${shape.path ? 'has-wave' : 'baseline-only'}`}
+        style={lanePixelStyle(shape.startTime, shape.endTime, AUDIO_SEGMENT_MIN_WIDTH_PX)}
         title={`audio ${shape.startTime}ms - ${shape.endTime}ms`}
       >
-        <svg className="wave-svg" viewBox={`0 0 ${WAVE_SVG_WIDTH} 100`} preserveAspectRatio="none">
-          <path className="wave-fill" d={shape.path} />
+        <svg
+          className="wave-svg"
+          viewBox={`0 0 ${WAVE_SVG_WIDTH} 100`}
+          preserveAspectRatio="none"
+        >
+          {shape.path
+            ? <path className="wave-fill" d={shape.path} />
+            : <line className="wave-baseline" x1="0" y1="50" x2={WAVE_SVG_WIDTH} y2="50" />}
         </svg>
       </div>
     ));
   }, [lanePixelStyle, waveShapes]);
+
+  const collectWaveDiagnostics = useCallback(() => {
+    const combined = combinedLaneRef.current;
+    const wave = waveLayerRef.current;
+    const thumbs = thumbsLayerRef.current;
+
+    const combinedRect = combined?.getBoundingClientRect();
+    const waveRect = wave?.getBoundingClientRect();
+    const thumbsRect = thumbs?.getBoundingClientRect();
+    const waveStyle = wave ? window.getComputedStyle(wave) : null;
+    const thumbsStyle = thumbs ? window.getComputedStyle(thumbs) : null;
+    const renderedWavePaths = waveShapes.filter((shape) => shape.path.length > 0).length;
+    const baselineSegments = waveShapes.length - renderedWavePaths;
+    const totalWavePoints = audioSegments.reduce((acc, segment) => acc + segment.waveform.length, 0);
+
+    const next: WaveDiagnostics = {
+      audioSegmentCount: audioSegments.length,
+      totalWavePoints,
+      renderedWavePaths,
+      baselineSegments,
+      combinedLaneHeightPx: combinedRect ? Math.round(combinedRect.height) : 0,
+      waveLayerHeightPx: waveRect ? Math.round(waveRect.height) : 0,
+      thumbsLayerHeightPx: thumbsRect ? Math.round(thumbsRect.height) : 0,
+      waveLayerZ: waveStyle ? parseZIndex(waveStyle.zIndex) : 0,
+      thumbsLayerZ: thumbsStyle ? parseZIndex(thumbsStyle.zIndex) : 0,
+      waveLayerDisplay: waveStyle?.display ?? '',
+      waveLayerVisibility: waveStyle?.visibility ?? '',
+      waveLayerOpacity: waveStyle ? Number.parseFloat(waveStyle.opacity || '1') : 1,
+    };
+
+    setWaveDiagnostics((prev) => {
+      if (
+        prev.audioSegmentCount === next.audioSegmentCount
+        && prev.totalWavePoints === next.totalWavePoints
+        && prev.renderedWavePaths === next.renderedWavePaths
+        && prev.baselineSegments === next.baselineSegments
+        && prev.combinedLaneHeightPx === next.combinedLaneHeightPx
+        && prev.waveLayerHeightPx === next.waveLayerHeightPx
+        && prev.thumbsLayerHeightPx === next.thumbsLayerHeightPx
+        && prev.waveLayerZ === next.waveLayerZ
+        && prev.thumbsLayerZ === next.thumbsLayerZ
+        && prev.waveLayerDisplay === next.waveLayerDisplay
+        && prev.waveLayerVisibility === next.waveLayerVisibility
+        && prev.waveLayerOpacity === next.waveLayerOpacity
+      ) {
+        return prev;
+      }
+      return next;
+    });
+
+    const cause = classifyWaveVisibilityCause(next);
+    if (cause !== 'ok') {
+      console.warn('[UniFlow][WaveDiag] wave visibility risk', { cause, ...next });
+    }
+  }, [audioSegments, waveShapes]);
 
   useEffect(() => {
     const scroll = scrollRef.current;
@@ -553,8 +743,7 @@ export const TimelineTrack: React.FC<TimelineTrackProps> = ({
       return () => observer.disconnect();
     }
 
-    window.addEventListener('resize', updateWidth);
-    return () => window.removeEventListener('resize', updateWidth);
+    return subscribeWindowResize(updateWidth);
   }, []);
 
   useEffect(() => {
@@ -585,6 +774,26 @@ export const TimelineTrack: React.FC<TimelineTrackProps> = ({
     }
   }, [currentTime, timeToPx]);
 
+  useEffect(() => {
+    collectWaveDiagnostics();
+    if (typeof ResizeObserver !== 'undefined') {
+      const observer = new ResizeObserver(() => {
+        collectWaveDiagnostics();
+      });
+      if (combinedLaneRef.current) {
+        observer.observe(combinedLaneRef.current);
+      }
+      if (waveLayerRef.current) {
+        observer.observe(waveLayerRef.current);
+      }
+      if (thumbsLayerRef.current) {
+        observer.observe(thumbsLayerRef.current);
+      }
+      return () => observer.disconnect();
+    }
+    return subscribeWindowResize(collectWaveDiagnostics);
+  }, [collectWaveDiagnostics, timelineWidth, viewportWidth]);
+
   const displayTime = dragPreview?.snappedTime ?? currentTime;
   const showSnapGuide = Boolean(
     dragPreview
@@ -592,6 +801,24 @@ export const TimelineTrack: React.FC<TimelineTrackProps> = ({
     && Math.abs(timeToPx(dragPreview.rawTime) - timeToPx(dragPreview.snappedTime)) >= 1,
   );
   const timeBubble = formatTimecodeLabel(displayTime, fpsSafe);
+  const hasRecordingDiagnostics = !!recordingDiagnostics
+    && (
+      recordingDiagnostics.startedAtMs > 0
+      || recordingDiagnostics.stoppedAtMs > 0
+      || recordingDiagnostics.blobSizeBytes > 0
+      || recordingDiagnostics.insertedWavePoints > 0
+      || recordingDiagnostics.lastError.length > 0
+    );
+  const forceWaveDiagnosticPanel = typeof window !== 'undefined'
+    && (window as typeof window & { __UNIFLOW_WAVE_DEBUG__?: boolean }).__UNIFLOW_WAVE_DEBUG__ === true;
+  const showWaveDiagnostics = (
+    forceWaveDiagnosticPanel
+    || (recordingDiagnostics?.lastError.length ?? 0) > 0
+    || classifyWaveVisibilityCause(waveDiagnostics) !== 'ok'
+    || (hasRecordingDiagnostics && waveDiagnostics.audioSegmentCount === 0)
+    || (hasRecordingDiagnostics && waveDiagnostics.audioSegmentCount > 0 && waveDiagnostics.totalWavePoints <= 0)
+  );
+  const waveVisibilityCause = classifyWaveVisibilityCause(waveDiagnostics);
 
   return (
     <div className="panel timeline-track">
@@ -681,10 +908,34 @@ export const TimelineTrack: React.FC<TimelineTrackProps> = ({
           <div className="track-action-lane">{actionLayer}</div>
 
           <div className="track-lane-label mono timeline">Timeline</div>
-          <div className="track-combined-lane">
-            <div className="track-thumbs-layer">{segmentLayer}</div>
-            <div className="track-wave-layer">{waveLayer}</div>
+          <div ref={combinedLaneRef} className="track-combined-lane">
+            <div ref={thumbsLayerRef} className="track-thumbs-layer">{segmentLayer}</div>
+            <div ref={waveLayerRef} className="track-wave-layer">{waveLayer}</div>
           </div>
+          {showWaveDiagnostics ? (
+            <div style={WAVE_DIAGNOSTIC_PANEL_STYLE}>
+              <span>aud:{waveDiagnostics.audioSegmentCount}</span>
+              <span>pts:{waveDiagnostics.totalWavePoints}</span>
+              <span>path:{waveDiagnostics.renderedWavePaths}</span>
+              <span>base:{waveDiagnostics.baselineSegments}</span>
+              <span>laneH:{waveDiagnostics.combinedLaneHeightPx}</span>
+              <span>waveH:{waveDiagnostics.waveLayerHeightPx}</span>
+              <span>zW:{waveDiagnostics.waveLayerZ}</span>
+              <span>zT:{waveDiagnostics.thumbsLayerZ}</span>
+              <span>cause:{waveVisibilityCause}</span>
+              {recordingDiagnostics ? (
+                <>
+                  <span>blob:{recordingDiagnostics.blobSizeBytes}</span>
+                  <span>decPts:{recordingDiagnostics.decodedWavePoints}</span>
+                  <span>addPts:{recordingDiagnostics.insertedWavePoints}</span>
+                  <span>addDur:{Math.max(0, recordingDiagnostics.insertedEndMs - recordingDiagnostics.insertedStartMs)}</span>
+                  <span>fb:{recordingDiagnostics.fallbackUsed ? 'Y' : 'N'}</span>
+                  <span>url:{recordingDiagnostics.sourceUrlReady ? 'Y' : 'N'}</span>
+                  {recordingDiagnostics.lastError ? <span>err:1</span> : <span>err:0</span>}
+                </>
+              ) : null}
+            </div>
+          ) : null}
 
           {dragPreview ? (
             <div

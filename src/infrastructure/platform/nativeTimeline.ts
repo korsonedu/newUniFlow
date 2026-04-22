@@ -17,23 +17,13 @@ import {
   rippleDeleteTimeRange,
   splitTimeline,
 } from '../../engine/timelineEngine';
+import { hasTauriRuntime } from './runtime';
 
 type TauriInvoke = <T>(command: string, payload?: Record<string, unknown>) => Promise<T>;
 
-type TauriRuntimeWindow = Window & typeof globalThis & {
-  __TAURI__?: unknown;
-  __TAURI_INTERNALS__?: unknown;
-};
-
 const toNativeTime = (value: number): number => Math.round(normalizeTimelineTime(value));
 
-const hasTauriRuntime = (): boolean => {
-  if (typeof window === 'undefined') {
-    return false;
-  }
-  const runtimeWindow = window as TauriRuntimeWindow;
-  return !!runtimeWindow.__TAURI__ || !!runtimeWindow.__TAURI_INTERNALS__;
-};
+export const hasNativeTimelineRuntime = (): boolean => hasTauriRuntime();
 
 let invokeCachePromise: Promise<TauriInvoke | null> | null = null;
 let printedFallbackWarning = false;
